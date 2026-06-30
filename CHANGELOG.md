@@ -14,6 +14,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Staged runtime cache hits now require a private cache directory and runtime files that match the installed copies; stale or tampered staged files are rebuilt before use.
 
 
+### Added
+
+- Support for ghostel for REPL terminal emulation ([#196](https://github.com/gcv/julia-snail/pull/196)).
+
+
 ## [1.3.3] — 2026-04-02
 
 ### Fixed

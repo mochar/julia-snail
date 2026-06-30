@@ -80,6 +80,7 @@
 (defvar ghostel-shell)
 (defvar ghostel-buffer-name)
 
+
 ;;; --- customizations
 
 (defgroup julia-snail nil
