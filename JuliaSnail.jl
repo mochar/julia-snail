@@ -946,10 +946,15 @@ function start(port=10011; addr="127.0.0.1")
                      send_to_client(resp, client)
                   else
                      try
+                        exc_stack = current_exceptions()
+                        err_str = sprint(exc_stack; context=:color => true) do io, stack
+                           Base.invokelatest(Base.display_error, io, stack)
+                        end
+                        
                         resp = elexpr([
                            Symbol("julia-snail--response-failure"),
                            input.reqid,
-                           sprint(showerror, err),
+                           err_str,
                            tuple(string.(stacktrace(catch_backtrace()))...)
                         ])
                         send_to_client(resp, client)

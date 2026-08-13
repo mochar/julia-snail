@@ -43,6 +43,7 @@
 (require 'subr-x)
 (require 'thingatpt)
 (require 'xref)
+(require 'ansi-color)
 
 ;; XXX: One of vterm, eat, or ghostel must be manually installed before Snail starts.
 ;; Picking one or the other involves tradeoffs best left to the user, and
@@ -361,6 +362,11 @@ nil means disable Snail-specific imenu integration (fall back on julia-mode impl
     (julia-loc . ("\\(around\\|at\\|Revise\\) \\([^ ><()\t\n,'\";:]+\\):\\([0-9]+\\)" 2 3))
     ;; matches "omitting file /tmp/Foo.jl due to parsing error near line 2", from Revise.parse_source!
     (julia-warn-revise . ("omitting file \\([^ ><()\t\n,'\";:]+\\) due to parsing error near line \\([0-9]+\\)" 1 2))
+    ;; matches "@ <something> /tmp/Foo.jl:2"
+    ;; skips "Closest candidates are" matches 
+    (julia-stacktrace .
+                      ("^[ \t]*\\[[0-9]+\\][^\n]*\n[ \t]*@[ \t]+\\(?:[a-zA-Z0-9_.#]+[ \t]+\\)?\\(\\([^ \t\n:]+\\):\\([0-9]+\\)\\)"
+                       2 3 nil nil 1))
     )
   "Specifications for highlighting error locations.
 Uses function `compilation-shell-minor-mode'.")
@@ -403,7 +409,8 @@ Uses function `compilation-shell-minor-mode'.")
         (erase-buffer)
         (insert message)
         (goto-char (point-min))
-        (when (and markdown (fboundp 'markdown-mode))
+        (cond
+         ((and markdown (fboundp 'markdown-mode))
           (defvar markdown-hide-markup)
           (declare-function markdown-mode "markdown-mode.el")
           (declare-function markdown-view-mode "markdown-mode.el")
@@ -412,6 +419,8 @@ Uses function `compilation-shell-minor-mode'.")
             (if (fboundp 'markdown-view-mode)
                 (markdown-view-mode)
               (markdown-mode))))
+         (t
+          (ansi-color-apply-on-region (point-min) (point-max))))
         (read-only-mode 1)
         (julia-snail-message-buffer-mode 1))
       msg-buf)))
@@ -422,11 +431,11 @@ Uses function `compilation-shell-minor-mode'.")
   "Setup compilation mode for the the current buffer in MESSAGE-BUFFER.
 BASEDIR is used for resolving relative paths."
   (with-current-buffer message-buffer
+    (compilation-mode)
     (setq-local compilation-error-regexp-alist-alist
                 julia-snail--compilation-regexp-alist)
     (setq-local compilation-error-regexp-alist
                 (mapcar #'car compilation-error-regexp-alist-alist))
-    (compilation-mode)
     (when basedir
       (setq-local compilation-search-path (list basedir)))))
 
@@ -1245,7 +1254,9 @@ evaluated in the context of MODULE."
            (error-buffer (julia-snail--message-buffer
                           repl-buf
                           "error"
-                          (format "%s\n\n%s" error-message (s-join "\n" error-stack))))
+                          ;; (format "%s\n\n%s" error-message (s-join "\n" error-stack))
+                          error-message
+                          ))
            (callback-failure (julia-snail--request-tracker-callback-failure request-info)))
       (when (julia-snail--request-tracker-display-error-buffer-on-failure? request-info)
         (julia-snail--setup-compilation-mode error-buffer (gethash process-buf julia-snail--cache-proc-basedir))
