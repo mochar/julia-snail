@@ -264,6 +264,13 @@ function eval_tmpfile(tmpfile, modpath, realfile, linenum,
    if isdefined(Base, :MainInclude) && isdefined(Base.MainInclude, :ans)
       Base.MainInclude.ans = result
    end
+
+   if !isnothing(result)
+      if showable("image/png", result) || showable("image/svg+xml", result)
+         display(result)
+      end
+    end
+   
    if isnothing(popup_params)
       Main.JuliaSnail.elexpr(true)
    else
