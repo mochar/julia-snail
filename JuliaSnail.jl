@@ -762,9 +762,11 @@ end
 const EMACS = EmacsDisplay()
 
 function send(img_encoded)
+   reqid = get(task_local_storage(), :snail_reqid, nothing)
    el = Main.JuliaSnail.elexpr([
       Symbol("julia-snail-multimedia-display"),
-      img_encoded
+      img_encoded,
+      reqid
    ])
    Main.JuliaSnail.send_to_client(el)
 end
@@ -928,6 +930,8 @@ function start(port=10011; addr="127.0.0.1")
                continue
             end
             active_task = @task begin # process input
+               task_local_storage(:snail_reqid, input.reqid)
+               
                try
                   result = eval_in_module(input.ns, expr)
                   # report successful evaluation back to client

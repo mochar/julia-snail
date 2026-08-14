@@ -1711,7 +1711,7 @@ evaluated in the context of MODULE."
 ;;; --- multimedia support
 ;;; Adapted from a PR by https://github.com/dahtah (https://github.com/gcv/julia-snail/pull/21).
 
-(defun julia-snail-multimedia-display (img)
+(defun julia-snail-multimedia-display (img &optional reqid)
   (let* ((repl-buf (get-buffer julia-snail-repl-buffer))
          (style (buffer-local-value 'julia-snail-multimedia-buffer-style repl-buf))
          (mm-buf-name-base (format "%s mm" (buffer-name repl-buf)))
@@ -1756,7 +1756,8 @@ evaluated in the context of MODULE."
       (dolist (win (get-buffer-window-list mm-buf))
         (set-window-point win (point-max)))
       (read-only-mode 1)
-      (julia-snail-multimedia-buffer-mode 1))
+      (julia-snail-multimedia-buffer-mode 1)
+      (setq-local julia-snail-multimedia-source-reqid reqid))
     (display-buffer mm-buf)
     (when julia-snail-multimedia-buffer-autoswitch
       (pop-to-buffer mm-buf))))
