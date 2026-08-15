@@ -160,6 +160,43 @@ end
 
 end
 
+### --- stream code
+
+using ScopedStreams
+
+struct SnailLiveStream <: IO
+    client
+    buffer::IOBuffer
+end
+
+SnailLiveStream(client) = SnailLiveStream(client, IOBuffer())
+
+# Tell Julia that our Emacs bridge supports ANSI colors
+Base.get(s::SnailLiveStream, key::Symbol, default) = key === :color ? true : default
+
+# Catch bulk string writes efficiently (prevents byte-by-byte fallback)
+function Base.unsafe_write(s::SnailLiveStream, p::Ptr{UInt8}, n::UInt)
+    return Base.unsafe_write(s.buffer, p, n)
+end
+
+# Catch single bytes just in case
+function Base.write(s::SnailLiveStream, x::UInt8)
+    return write(s.buffer, x)
+end
+
+# Only send the data to Emacs when the stream is flushed
+function Base.flush(s::SnailLiveStream)
+    if s.buffer.size > 0
+        chunk = String(take!(s.buffer))
+        resp = elexpr([Symbol("julia-snail--stream"), chunk])
+        send_to_client(resp, s.client)
+    end
+    return nothing
+end
+
+Base.isopen(s::SnailLiveStream) = isopen(s.client)
+
+@gen_scoped_stream_methods
 
 ### --- evaluation helpers for Julia code coming in from Emacs
 
@@ -184,7 +221,7 @@ is equivalent to
 Main.One.Two.Three.eval(:(x = 3 + 5))
 ```
 """
-function eval_in_module(fully_qualified_module_name::Array{Symbol}, expr::Union{Symbol, Expr})
+function eval_in_module(fully_qualified_module_name::Array{Symbol}, expr::Union{Symbol, Expr}; io::Union{SnailLiveStream, Nothing}=nothing)
    # Work around Julia top-level loading requirements for certain forms; also:
    # https://github.com/gcv/julia-snail/pull/78
    if isa(expr, Expr) && expr.head == :block
@@ -223,7 +260,15 @@ function eval_in_module(fully_qualified_module_name::Array{Symbol}, expr::Union{
       Base.invokelatest(Main.Revise.revise)
    end
    # go
-   return Core.eval(fqm, expr)
+   if io === nothing
+      return Core.eval(fqm, expr)
+   else
+      return redirect_stream(io, io) do
+         res = Core.eval(fqm, expr)
+         flush(io)
+         res
+      end
+   end
 end
 
 """
@@ -272,7 +317,7 @@ function eval_tmpfile(tmpfile, modpath, realfile, linenum,
     end
    
    if isnothing(popup_params)
-      Main.JuliaSnail.elexpr(true)
+      Main.JuliaSnail.elexpr(true, result)
    else
       Main.JuliaSnail.elexpr((
          true,
@@ -938,9 +983,10 @@ function start(port=10011; addr="127.0.0.1")
             end
             active_task = @task begin # process input
                task_local_storage(:snail_reqid, input.reqid)
-               
+               snail_io = SnailLiveStream(client)
+
                try
-                  result = eval_in_module(input.ns, expr)
+                  result = eval_in_module(input.ns, expr, io=snail_io)
                   # report successful evaluation back to client
                   resp = elexpr([
                      Symbol("julia-snail--response-success"),

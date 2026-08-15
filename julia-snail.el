@@ -1269,6 +1269,72 @@ evaluated in the context of MODULE."
   "Snail task interruption response handler for REQID."
   (julia-snail--response-base reqid))
 
+;;; --- Snail server stream handling
+
+;; Taken from `jupyter-handle-control-codes'
+(defun jupyter-snail--handle-control-codes (beg end)
+  "Handle any control sequences between BEG and END."
+  (save-excursion
+    (goto-char beg)
+    (while (< (point) end)
+      (let ((char (char-after)))
+        (cond
+         ((eq char ?\r)
+          (if (< (1+ (point)) end)
+              (if (memq (char-after (1+ (point)))
+                        '(?\n ?\r))
+                  (delete-char 1)
+                (let ((end (1+ (point))))
+                  (beginning-of-line)
+                  (delete-region (point) end)))
+            (add-text-properties (point) (1+ (point))
+                                 '(invisible t))
+            (forward-char)))
+         ((eq char ?\a)
+          (delete-char 1)
+          (beep))
+         ((eq char ?\C-h)
+          (delete-region (1- (point)) (1+ (point))))
+         (t
+          (forward-char)))))))
+
+(defun julia-snail--stream (chunk)
+  (let ((buf (get-buffer-create "*Snail Live Output*")))
+    (with-current-buffer buf
+      (let ((inhibit-read-only t)
+            ;; (buffer-undo-list t) ; dont record undos
+            (start (point-max)))
+
+        (goto-char start)
+        (insert chunk)
+        
+        ;; 2. REWIND to the beginning of the line where we started inserting.
+        ;; (This fixes the bug where chunks ending in \n caused the cursor 
+        ;; to jump to a blank line and skip processing entirely!)
+        (setq start (save-excursion
+                      (goto-char start)
+                      (line-beginning-position)))
+        
+        ;; 3. Handle Carriage Returns (\r)
+        ;; Physically delete the old text before the \r so it can't bleed through
+        (goto-char start)
+        (while (search-forward "\r" nil t)
+          (delete-region (line-beginning-position) (point)))
+        
+        ;; 4. Handle 'Clear to End of Line' (\e[K or \033[K)
+        (goto-char start)
+        (while (re-search-forward "\033\\[K" nil t)
+          (replace-match "")
+          (delete-region (point) (line-end-position)))
+        
+        ;; 5. Render ANSI Colors
+        (ansi-color-apply-on-region start (point-max))
+        
+        ;; 6. Keep cursor at the bottom
+        (goto-char (point-max))))
+    (display-buffer buf)))
+
+
 
 ;;; --- CST parser interface
 
