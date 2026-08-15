@@ -1,6 +1,5 @@
 ;;; julia-snail.el --- Julia Snail -*- lexical-binding: t -*-
 
-
 ;; URL: https://github.com/gcv/julia-snail
 ;; Package-Requires: ((emacs "26.2") (dash "2.16.0") (julia-mode "0.3") (s "1.12.0") (spinner "1.7.3") (popup "0.5.9"))
 ;; Version: 1.3.3
@@ -21,6 +20,8 @@
 
 ;;; Commentary:
 
+;; A heavily modified fork of gcv/julia-snail
+
 ;; This package provides an interactive development environment for Julia
 ;; (https://julialang.org/), similar to SLIME for Common Lisp and CIDER for
 ;; Clojure. Refer to the README.md file for documentation.
@@ -28,7 +29,7 @@
 ;;; Code:
 
 
-;;; --- requirements
+;;;; Requires
 
 (require 'cl-lib)
 (require 'dash)
@@ -82,7 +83,7 @@
 (defvar ghostel-buffer-name)
 
 
-;;; --- customizations
+;;;; Customizations
 
 (defgroup julia-snail nil
   "Customization options for Julia Snail mode."
@@ -265,7 +266,7 @@ nil means disable Snail-specific imenu integration (fall back on julia-mode impl
 (make-variable-buffer-local 'julia-snail-extensions)
 
 
-;;; --- constants
+;;;; Constants
 
 (defconst julia-snail--julia-files
   ;; a slightly specialized directory walker to collect the correct file and directory list:
@@ -307,7 +308,7 @@ nil means disable Snail-specific imenu integration (fall back on julia-mode impl
          julia-snail--julia-files-local))
 
 
-;;; --- supporting data structures
+;;;; Supporting data structures
 
 (cl-defstruct julia-snail--request-tracker
   "Snail protocol request tracking data structure."
@@ -325,14 +326,14 @@ nil means disable Snail-specific imenu integration (fall back on julia-mode impl
   value)
 
 
-;;; --- variables
+;;;; Variables
 
 (defvar julia-snail-debug nil
   "When t, show more runtime information.")
 
 (defvar-local julia-snail--process nil)
 
-;;; TODO: Maybe this should hash by proc+reqid rather than just reqid?
+;; TODO: Maybe this should hash by proc+reqid rather than just reqid?
 (defvar julia-snail--requests
   (make-hash-table :test #'equal))
 
@@ -372,13 +373,13 @@ nil means disable Snail-specific imenu integration (fall back on julia-mode impl
 Uses function `compilation-shell-minor-mode'.")
 
 
-;;; --- pre-declarations
+;;;; Pre-declarations
 
 (defvar julia-snail-mode)
 (defvar julia-snail-repl-mode)
 
 
-;;; --- supporting functions
+;;;; Supporting functions
 
 (defun julia-snail--copy-buffer-local-vars (from-buf)
   "Copy Snail-related buffer-local variables from FROM-BUF to the current buffer."
@@ -801,7 +802,7 @@ returns \"/home/username/file.jl\"."
       (format " Snail%s" (if extra extra "")))))
 
 
-;;; --- color shifting utilities, adapted from mini-frame.el
+;;;; Color shifting utilities, adapted from mini-frame.el
 
 (cl-defun julia-snail--color-shift (from to &key (by 27))
   "Move color FROM towards TO by BY. FROM and TO are 16-bit integer values."
@@ -824,7 +825,7 @@ returns \"/home/username/file.jl\"."
               (julia-snail--color-shift (caddr from) (caddr to) :by by)))))
 
 
-;;; --- connection management functions
+;;;; Connection management functions
 
 (defun julia-snail--clear-proc-caches (process-buf)
   "Clear connection-specific internal Snail xref, completion, and module caches."
@@ -973,7 +974,7 @@ returns \"/home/username/file.jl\"."
   )
 
 
-;;; --- terminal emulator compatibility wrappers
+;;;; Terminal emulator compatibility wrappers
 
 (defun julia-snail--terminal-send-string (str)
   (cond
@@ -1014,7 +1015,7 @@ returns \"/home/username/file.jl\"."
     (error "function called out of context; (with-current-buffer repl-buf ...) required"))))
 
 
-;;; --- Julia REPL and Snail server interaction functions
+;;;; Julia REPL and Snail server interaction functions
 
 (defun julia-snail--looking-back-string (str)
   "Return t if the buffer contents preceding point matches `str'. The same
@@ -1221,7 +1222,7 @@ evaluated in the context of MODULE."
            (throw 'julia-snail--server-filter-error err)))))))
 
 
-;;; --- Snail server response handling functions
+;;;; Snail server response handling functions
 
 (defun julia-snail--response-base (reqid)
   "Snail response handler for REQID, base function."
@@ -1269,7 +1270,7 @@ evaluated in the context of MODULE."
   "Snail task interruption response handler for REQID."
   (julia-snail--response-base reqid))
 
-;;; --- Snail server stream handling
+;;;; Snail server stream handling
 
 ;; Taken from `jupyter-handle-control-codes'
 (defun jupyter-snail--handle-control-codes (beg end)
@@ -1335,7 +1336,7 @@ evaluated in the context of MODULE."
 
 
 
-;;; --- CST parser interface
+;;;; CST parser interface
 
 (defun julia-snail--cst-module-at (buf pt)
   (let* ((byteloc (position-bytes pt))
@@ -1382,7 +1383,7 @@ evaluated in the context of MODULE."
     res))
 
 
-;;; --- Julia module tracking implementation
+;;;; Julia module tracking implementation
 
 (defun julia-snail--module-merge-includes (current-filename includes)
   "Update file module cache using INCLUDES tree parsed from CURRENT-FILENAME."
@@ -1422,7 +1423,7 @@ evaluated in the context of MODULE."
         '("Main"))))
 
 
-;;; --- xref implementation
+;;;; Xref implementation
 
 (defun julia-snail-xref-backend ()
   "Emacs xref API: return the Snail xref backend when Snail is usable."
@@ -1492,14 +1493,14 @@ evaluated in the context of MODULE."
                 :async nil)))
     (julia-snail--make-xrefs-helper res)))
 
-;;; TODO: Implement this. See
-;;; https://discourse.julialang.org/t/finding-uses-of-a-method/32729/3 for
-;;; information about how it can be done. Key points: (1) It is most reliable
-;;; for executed code, which is of course a non-starter for IDE functionality.
-;;; (2) It can be done by iterating through all methods in all modules and
-;;; calling Base.uncompressed_ast and looking for appropriate calls. Seems like
-;;; it won't be accurate for functions called through indirection, but would
-;;; definitely be a step in the right direction.
+;; TODO: Implement this. See
+;; https://discourse.julialang.org/t/finding-uses-of-a-method/32729/3 for
+;; information about how it can be done. Key points: (1) It is most reliable
+;; for executed code, which is of course a non-starter for IDE functionality.
+;; (2) It can be done by iterating through all methods in all modules and
+;; calling Base.uncompressed_ast and looking for appropriate calls. Seems like
+;; it won't be accurate for functions called through indirection, but would
+;; definitely be a step in the right direction.
 (cl-defmethod xref-backend-references ((_backend (eql xref-julia-snail)) _identifier)
   nil)
 
@@ -1513,7 +1514,7 @@ evaluated in the context of MODULE."
     (julia-snail--make-xrefs-helper res)))
 
 
-;;; --- completion implementation
+;;;; Completion implementation
 
 (defun julia-snail--repl-completions (identifier &optional module-finder)
   (let* ((module (if module-finder (apply module-finder (list)) (julia-snail--module-at-point)))
@@ -1551,7 +1552,7 @@ evaluated in the context of MODULE."
             :exclusive 'no))))
 
 
-;;; --- imenu enhancement
+;;;; Imenu enhancement
 
 ;; TODO: Add marginalia metadata. Use completion-extra-properties
 ;; :annotation-function for this? How, exactly?
@@ -1635,7 +1636,7 @@ evaluated in the context of MODULE."
     imenu-index))
 
 
-;;; --- popup display support
+;;;; Popup display support
 
 (defun julia-snail--popup-params (pt)
   (when julia-snail-popup-display-eval-results
@@ -1731,7 +1732,7 @@ evaluated in the context of MODULE."
       (add-hook hook #'julia-snail--popup-cleanup nil 'local))))
 
 
-;;; --- support for completion modes' auxiliary doc modes (company-quickhelp and corfu-doc)
+;;;; Support for completion modes' auxiliary doc modes (company-quickhelp and corfu-doc)
 
 (defun julia-snail--completions-doc-buffer (str)
   (let* ((module (julia-snail--module-at-point))
@@ -1761,7 +1762,7 @@ evaluated in the context of MODULE."
     (cl-concatenate 'list comp doc)))
 
 
-;;; --- eldoc implementation
+;;;; Eldoc implementation
 
 (defun julia-snail-eldoc ()
   "Implementation for ElDoc."
@@ -1773,8 +1774,8 @@ evaluated in the context of MODULE."
 )
 
 
-;;; --- multimedia support
-;;; Adapted from a PR by https://github.com/dahtah (https://github.com/gcv/julia-snail/pull/21).
+;;;; Multimedia support
+;; Adapted from a PR by https://github.com/dahtah (https://github.com/gcv/julia-snail/pull/21).
 
 (defun julia-snail-multimedia-display (img &optional reqid)
   (let* ((repl-buf (get-buffer julia-snail-repl-buffer))
@@ -1841,7 +1842,7 @@ evaluated in the context of MODULE."
        :async nil))))
 
 
-;;; --- extension support
+;;;; Extension support
 
 (defun julia-snail--extension-symbol (extname)
   (intern (format "julia-snail/%s" extname)))
@@ -1864,7 +1865,7 @@ evaluated in the context of MODULE."
         (require extsym extfile)))))
 
 
-;;; --- commands
+;;;; Commands
 
 ;;;###autoload
 (defun julia-snail ()
@@ -2168,7 +2169,7 @@ autocompletion aware of the available modules."
           (remhash reqid julia-snail--requests))))))
 
 
-;;; --- keymaps
+;;;; Keymaps
 
 (defvar julia-snail-mode-map
   (let ((map (make-sparse-keymap)))
@@ -2192,7 +2193,7 @@ autocompletion aware of the available modules."
     map))
 
 
-;;; --- mode menu
+;;;; Mode menu
 
 (easy-menu-define julia-snail-mode-menu julia-snail-mode-map
   "Julia-Snail mode menu."
@@ -2214,7 +2215,7 @@ autocompletion aware of the available modules."
     ["Switch to source" julia-snail-repl-go-back]))
 
 
-;;; --- mode definitions
+;;;; Mode definitions
 
 ;;;###autoload
 (define-minor-mode julia-snail-mode
@@ -2282,7 +2283,7 @@ The following keys are set:
   :keymap '(((kbd "q") . quit-window)))
 
 
-;;; --- done
+;;;; Footer
 
 (provide 'julia-snail)
 

@@ -13,9 +13,9 @@
 
 import Pkg
 
-
 module JuliaSnail
 
+### Pkg hack
 
 # XXX: External dependency hack. Snail's own dependencies need to be listed
 # first in LOAD_PATH during initial load, otherwise conflicting versions
@@ -58,6 +58,7 @@ end
      throw(ArgumentError("CSTParser API not compatible, must install Snail-specific version"))
 end
 
+### Imports / exports
 
 import Markdown
 import Printf
@@ -69,7 +70,7 @@ using Base.ScopedValues: ScopedValue, @with
 export start, stop
 
 
-### --- configuration
+### Configuration
 
 module Conf
 
@@ -80,7 +81,7 @@ set!(var, val) = Base.eval(Main.JuliaSnail.Conf, :($var = $val))
 end
 
 
-### --- Elisp s-expression constructor
+### Elisp s-expression constructor
 
 struct ElispKeyword
    kw::Symbol
@@ -136,7 +137,7 @@ function elexpr(arg::ElispKeyword)
 end
 
 
-### --- Emacs popup display helper
+### Emacs popup display helper
 
 module PopupDisplay
 
@@ -161,7 +162,7 @@ end
 
 end
 
-### --- Request stream code
+### Request stream code
 
 # Individual requests should have their own independent stdout/stderr so that we
 # can show it next to the request source (org src block or code region). However
@@ -226,7 +227,7 @@ Base.get(proxy::SnailProxyIO, key::Symbol, default) = get(_get_snail_io(proxy), 
 
 
 
-### --- evaluation helpers for Julia code coming in from Emacs
+### Evaluation helpers for Julia code coming in from Emacs
 
 struct UndefinedModule <: Exception
    name::Symbol
@@ -357,7 +358,7 @@ function eval_tmpfile(tmpfile, modpath, realfile, linenum,
 end
 
 
-### --- generic helpers
+### Generic helpers
 
 """
 try-catch wrapper.
@@ -399,7 +400,7 @@ function split_name(name::String, ns::Module=Main)
 end
 
 
-### --- introspection helpers
+### Introspection helpers
 
 """
 Return names of modules and identifiers in the given namespace.
@@ -570,7 +571,7 @@ function replcompletion(identifier, mod)
 end
 
 
-### --- CSTParser wrappers
+### CSTParser wrappers
 
 module CST
 
@@ -831,8 +832,8 @@ end
 end
 
 
-### --- multimedia support
-### Adapted from a PR by https://github.com/dahtah (https://github.com/gcv/julia-snail/pull/21).
+### Multimedia support
+## Adapted from a PR by https://github.com/dahtah (https://github.com/gcv/julia-snail/pull/21).
 
 module Multimedia
 
@@ -902,7 +903,7 @@ end
 end
 
 
-### --- extras: support for extending Snail
+### Extras: support for extending Snail
 
 module Extensions
 
@@ -918,7 +919,7 @@ end
 end
 
 
-### --- task handling code
+### Task handling code
 
 module Tasks
 
@@ -940,7 +941,7 @@ end
 end
 
 
-### --- server code
+### Server code
 
 running = false
 server_socket = nothing
