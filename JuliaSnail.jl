@@ -64,6 +64,7 @@ import Printf
 import REPL
 import Sockets
 import REPL.REPLCompletions
+using Base.ScopedValues: ScopedValue, @with
 
 export start, stop
 
@@ -160,43 +161,70 @@ end
 
 end
 
-### --- stream code
+### --- Request stream code
 
-using ScopedStreams
+# Individual requests should have their own independent stdout/stderr so that we
+# can show it next to the request source (org src block or code region). However
+# in julia stdout and stderr are globals. The solution here is to redirect the
+# global stdout and stderr through a proxy that will check if we are in a
+# request. If so we use the request's io, otherwise the defaut one. To know if
+# we are in a request, a ScopedValue is set to the request's RequestStream
+# instance. Scoped values are inherited across threads within a task whereas
+# task local storage is not.
 
-struct SnailLiveStream <: IO
-    client
-    buffer::IOBuffer
+struct RequestStream <: IO
+   client
+   reqid::String
+   buffer::IOBuffer
+   lock::ReentrantLock # Thread safety when multiple threads spawned in a task
 end
 
-SnailLiveStream(client) = SnailLiveStream(client, IOBuffer())
+RequestStream(client, reqid) = RequestStream(client, reqid, IOBuffer(), ReentrantLock())
 
-# Tell Julia that our Emacs bridge supports ANSI colors
-Base.get(s::SnailLiveStream, key::Symbol, default) = key === :color ? true : default
-
-# Catch bulk string writes efficiently (prevents byte-by-byte fallback)
-function Base.unsafe_write(s::SnailLiveStream, p::Ptr{UInt8}, n::UInt)
-    return Base.unsafe_write(s.buffer, p, n)
+function Base.unsafe_write(s::RequestStream, p::Ptr{UInt8}, n::UInt)
+    lock(s.lock) do
+        return Base.unsafe_write(s.buffer, p, n)
+    end
+end
+function Base.write(s::RequestStream, x::UInt8)
+    lock(s.lock) do
+        return write(s.buffer, x)
+    end
 end
 
-# Catch single bytes just in case
-function Base.write(s::SnailLiveStream, x::UInt8)
-    return write(s.buffer, x)
-end
-
-# Only send the data to Emacs when the stream is flushed
-function Base.flush(s::SnailLiveStream)
-    if s.buffer.size > 0
-        chunk = String(take!(s.buffer))
-        resp = elexpr([Symbol("julia-snail--stream"), chunk])
-        send_to_client(resp, s.client)
+function Base.flush(s::RequestStream)
+    lock(s.lock) do
+        if s.buffer.size > 0
+            chunk = String(take!(s.buffer))
+            resp = elexpr([Symbol("julia-snail--stream"), s.reqid, chunk])
+            send_to_client(resp, s.client)
+        end
     end
     return nothing
 end
 
-Base.isopen(s::SnailLiveStream) = isopen(s.client)
+Base.isopen(s::RequestStream) = isopen(s.client)
+Base.get(s::RequestStream, key::Symbol, default) = key === :color ? true : default
 
-@gen_scoped_stream_methods
+const CURRENT_REQUEST_STREAM = ScopedValue{Union{Nothing, RequestStream}}(nothing)
+
+# Global proxy
+struct SnailProxyIO <: IO
+    orig_io::IO
+end
+
+@inline function _get_snail_io(proxy::SnailProxyIO)
+    stream = CURRENT_REQUEST_STREAM[]
+    return stream !== nothing ? stream : proxy.orig_io
+end
+
+Base.unsafe_write(proxy::SnailProxyIO, p::Ptr{UInt8}, n::UInt) = Base.unsafe_write(_get_snail_io(proxy), p, n)
+Base.write(proxy::SnailProxyIO, x::UInt8) = write(_get_snail_io(proxy), x)
+Base.flush(proxy::SnailProxyIO) = flush(_get_snail_io(proxy))
+Base.isopen(proxy::SnailProxyIO) = isopen(_get_snail_io(proxy))
+Base.get(proxy::SnailProxyIO, key::Symbol, default) = get(_get_snail_io(proxy), key, default)
+
+
 
 ### --- evaluation helpers for Julia code coming in from Emacs
 
@@ -221,7 +249,7 @@ is equivalent to
 Main.One.Two.Three.eval(:(x = 3 + 5))
 ```
 """
-function eval_in_module(fully_qualified_module_name::Array{Symbol}, expr::Union{Symbol, Expr}; io::Union{SnailLiveStream, Nothing}=nothing)
+function eval_in_module(fully_qualified_module_name::Array{Symbol}, expr::Union{Symbol, Expr}; request_stream::Union{RequestStream, Nothing}=nothing)
    # Work around Julia top-level loading requirements for certain forms; also:
    # https://github.com/gcv/julia-snail/pull/78
    if isa(expr, Expr) && expr.head == :block
@@ -253,19 +281,21 @@ function eval_in_module(fully_qualified_module_name::Array{Symbol}, expr::Union{
    for m in fully_qualified_module_name[2:end]
       fqm = getfield(fqm, m)
    end
+   
    # If Revise is being used, force it to update its state; invokelatest is
    # necessary to deal with the World Age problem because Revise was probably
    # loaded after the main Snail loop started running.
    if isdefined(Main, :Revise)
       Base.invokelatest(Main.Revise.revise)
    end
+   
    # go
-   if io === nothing
+   if request_stream === nothing
       return Core.eval(fqm, expr)
    else
-      return redirect_stream(io, io) do
+      @with CURRENT_REQUEST_STREAM => request_stream begin
          res = Core.eval(fqm, expr)
-         flush(io)
+         flush(request_stream)
          res
       end
    end
@@ -945,6 +975,7 @@ function start(port=10011; addr="127.0.0.1")
          println(stderr, "ERROR: Snail will not work correctly.")
       end
    end
+   
    # XXX: It would be great to do this forcecompile trick in a Thread.@spawn
    # block. Unfortunately, as of Julia 1.6.1 this does not work. First, it's
    # meaningless unless Julia is started with JULIA_NUM_THREADS or --threads set
@@ -956,6 +987,13 @@ function start(port=10011; addr="127.0.0.1")
    #    end
    # end
    CST.forcecompile()
+
+   # Proxy stdout/stderr
+   if !isa(stdout, SnailProxyIO)
+      Base.eval(Base, :(stdout = $SnailProxyIO($stdout)))
+      Base.eval(Base, :(stderr = $SnailProxyIO($stderr)))
+   end   
+
    # main loop:
    @async begin
       while running
@@ -982,12 +1020,10 @@ function start(port=10011; addr="127.0.0.1")
                continue
             end
             active_task = @task begin # process input
-               task_local_storage(:snail_reqid, input.reqid)
-               snail_io = SnailLiveStream(client)
-
+               request_stream = RequestStream(client, input.reqid)
+               
                try
-                  result = eval_in_module(input.ns, expr, io=snail_io)
-                  # report successful evaluation back to client
+                  result = eval_in_module(input.ns, expr, request_stream=request_stream)
                   resp = elexpr([
                      Symbol("julia-snail--response-success"),
                      input.reqid,

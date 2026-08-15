@@ -1298,39 +1298,38 @@ evaluated in the context of MODULE."
          (t
           (forward-char)))))))
 
-(defun julia-snail--stream (chunk)
-  (let ((buf (get-buffer-create "*Snail Live Output*")))
+(defun julia-snail--stream (reqid chunk)
+  (let ((buf (get-buffer-create (format "*Snail Live Output <%s>*" reqid))))
     (with-current-buffer buf
       (let ((inhibit-read-only t)
-            ;; (buffer-undo-list t) ; dont record undos
+            (buffer-undo-list t) ; dont record undos
             (start (point-max)))
 
         (goto-char start)
         (insert chunk)
         
-        ;; 2. REWIND to the beginning of the line where we started inserting.
-        ;; (This fixes the bug where chunks ending in \n caused the cursor 
-        ;; to jump to a blank line and skip processing entirely!)
+        ;; Rewind to the beginning of the line where we started inserting.
+        ;; This fixes the bug where chunks ending in \n caused the cursor 
+        ;; to jump to a blank line and skip processing entirely
         (setq start (save-excursion
                       (goto-char start)
                       (line-beginning-position)))
         
-        ;; 3. Handle Carriage Returns (\r)
-        ;; Physically delete the old text before the \r so it can't bleed through
+        ;; Handle Carriage Returns (\r)
+        ;; Delete the old text before the \r so it can't bleed through
         (goto-char start)
         (while (search-forward "\r" nil t)
           (delete-region (line-beginning-position) (point)))
         
-        ;; 4. Handle 'Clear to End of Line' (\e[K or \033[K)
+        ;; Handle 'Clear to End of Line' (\e[K or \033[K)
         (goto-char start)
         (while (re-search-forward "\033\\[K" nil t)
           (replace-match "")
           (delete-region (point) (line-end-position)))
         
-        ;; 5. Render ANSI Colors
+        ;; Render ANSI Colors
         (ansi-color-apply-on-region start (point-max))
         
-        ;; 6. Keep cursor at the bottom
         (goto-char (point-max))))
     (display-buffer buf)))
 
