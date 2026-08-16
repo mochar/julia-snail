@@ -1415,15 +1415,21 @@ evaluated in the context of MODULE."
          (parent-modules (gethash filename proc-includes (list))))
     parent-modules))
 
-(defun julia-snail--module-at-point (&optional partial-module)
+(cl-defgeneric julia-snail--module-at-point (&optional partial-module)
   "Return the current Julia module at point as an Elisp list, including PARTIAL-MODULE if given."
+  (or partial-module '("Main")))
+
+(cl-defmethod julia-snail--module-at-point
+  (&context (major-mode julia-mode) &optional partial-module)
   (let ((partial-module (or partial-module
-                            (julia-snail--cst-module-at (current-buffer) (point))))
-        (module-for-file (julia-snail--module-for-file (buffer-file-name (buffer-base-buffer)))))
-    (or (if module-for-file
-            (append module-for-file partial-module)
-          partial-module)
-        '("Main"))))
+                            (julia-snail--cst-module-at (current-buffer) (point)))))
+    (if (buffer-file-name (buffer-base-buffer))
+        (let ((module-for-file (julia-snail--module-for-file (buffer-file-name (buffer-base-buffer)))))
+          (or (if module-for-file
+                  (append module-for-file partial-module)
+                partial-module)
+              '("Main")))
+      (or partial-module '("Main")))))
 
 
 ;;;; Xref implementation
@@ -2289,6 +2295,9 @@ The following keys are set:
   :lighter (:eval (julia-snail--mode-lighter " MM"))
   :keymap '(((kbd "q") . quit-window)))
 
+;;;; Org babel
+
+(require 'julia-snail-ob)
 
 ;;;; Footer
 

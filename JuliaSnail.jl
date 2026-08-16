@@ -913,6 +913,9 @@ end
 
 end
 
+### Org babel support
+
+include("ObJulia.jl")
 
 ### Extras: support for extending Snail
 
