@@ -226,6 +226,16 @@ Base.flush(proxy::SnailProxyIO) = flush(_get_snail_io(proxy))
 Base.isopen(proxy::SnailProxyIO) = isopen(_get_snail_io(proxy))
 Base.get(proxy::SnailProxyIO, key::Symbol, default) = get(_get_snail_io(proxy), key, default)
 
+# Tell Julia how to restore our proxy after a redirect_stdout() finishes
+function (r::Base.RedirectStdStream)(proxy::SnailProxyIO)
+    r(proxy.orig_io)
+    if r.unix_fd == 1
+        Base.eval(Base, :(stdout = $proxy))
+    elseif r.unix_fd == 2
+        Base.eval(Base, :(stderr = $proxy))
+    end
+    return proxy
+end
 
 
 ### Evaluation helpers for Julia code coming in from Emacs
