@@ -176,11 +176,12 @@ end
 struct RequestStream <: IO
     client
     reqid::String
+    redirect::Bool
     buffer::IOBuffer
     lock::ReentrantLock # Thread safety when multiple threads spawned in a task
 end
 
-RequestStream(client, reqid) = RequestStream(client, reqid, IOBuffer(), ReentrantLock())
+RequestStream(client, reqid, redirect) = RequestStream(client, reqid, redirect, IOBuffer(), ReentrantLock())
 
 function Base.unsafe_write(s::RequestStream, p::Ptr{UInt8}, n::UInt)
     lock(s.lock) do
@@ -216,7 +217,7 @@ end
 
 @inline function _get_snail_io(proxy::SnailProxyIO)
     stream = CURRENT_REQUEST_STREAM[]
-    return stream !== nothing ? stream : proxy.orig_io
+    return stream !== nothing && stream.redirect ? stream : proxy.orig_io
 end
 
 Base.unsafe_write(proxy::SnailProxyIO, p::Ptr{UInt8}, n::UInt) = Base.unsafe_write(_get_snail_io(proxy), p, n)
@@ -1021,7 +1022,7 @@ function start(port=10011; addr="127.0.0.1")
                     continue
                 end
                 active_task = @task begin # process input
-                    request_stream = RequestStream(client, input.reqid)
+                    request_stream = RequestStream(client, input.reqid, input.redirectio)
                
                     try
                         result = eval_in_module(input.ns, expr, request_stream=request_stream)

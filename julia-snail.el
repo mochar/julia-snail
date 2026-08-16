@@ -1062,6 +1062,7 @@ wait for the REPL prompt to return, otherwise return immediately."
      (async-poll-interval 20)
      (async-poll-maximum julia-snail-async-timeout)
      (display-error-buffer-on-failure? t)
+     (redirect-io t)
      callback-success
      callback-failure)
   "Send STR to Snail server, and evaluate it in the context of MODULE.
@@ -1079,14 +1080,18 @@ nil, wait for the result and return it."
          (display-code-str (if julia-snail-debug
                                code-str
                              (s-truncate 80 code-str)))
-         (msg (format "(ns = %s, reqid = \"%s\", code = %s)\n"
+         (redirect-io-str (if redirect-io "true" "false"))
+         (msg (format "(ns = %s, reqid = \"%s\", code = %s, redirectio = %s)\n"
                       module-ns
                       reqid
-                      code-str))
-         (display-msg (format "(ns = %s, reqid = \"%s\", code = %s)\n"
+                      code-str
+                      redirect-io-str
+                      ))
+         (display-msg (format "(ns = %s, reqid = \"%s\", code = %s, redirectio = %s)\n"
                               module-ns
                               reqid
-                              display-code-str))
+                              display-code-str
+                              redirect-io-str))
          (res-sentinel (gensym))
          (res res-sentinel))
     (with-current-buffer process-buf
