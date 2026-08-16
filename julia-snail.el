@@ -107,14 +107,6 @@
                  (repeat :tag "List of strings" string)))
 (make-variable-buffer-local 'julia-snail-extra-args)
 
-(defcustom julia-snail-port 10011
-  "Default Snail server port for Emacs to connect to."
-  :tag "Snail server port (local)"
-  :group 'julia-snail
-  :safe 'integerp
-  :type 'integer)
-(make-variable-buffer-local 'julia-snail-port)
-
 (defcustom julia-snail-remote-port nil
   "Default Snail server port when using a remote REPL. Do not set UNLESS using a remote REPL!"
   :tag "Snail server port (remote); do not set unless using remote REPL"
@@ -332,6 +324,12 @@ nil means disable Snail-specific imenu integration (fall back on julia-mode impl
   "When t, show more runtime information.")
 
 (defvar-local julia-snail--process nil)
+
+(defvar-local julia-snail-port nil
+  "Snail server port for Emacs to connect to.  If nil will be set automatically using `julia-snail-port-counter'.")
+
+(defvar julia-snail-port-counter 10011
+  "Counter for dynamically allocating Snail ports.")
 
 ;; TODO: Maybe this should hash by proc+reqid rather than just reqid?
 (defvar julia-snail--requests
@@ -1791,8 +1789,9 @@ evaluated in the context of MODULE."
                         (generate-new-buffer-name mm-buf-name-base)))
          (mm-buf (get-buffer-create mm-buf-name))
          (decoded-img (base64-decode-string img)))
-    (with-current-buffer julia-snail--repl-go-back-target
-      (spinner-stop))
+    (when (bound-and-true-p julia-snail--repl-go-back-target)
+      (with-current-buffer julia-snail--repl-go-back-target
+        (spinner-stop)))
     (with-current-buffer mm-buf
       ;; allow directly-inserted images to be erased
       (fundamental-mode)
@@ -1890,6 +1889,9 @@ To create multiple REPLs, give these variables distinct values (e.g.:
             (setq julia-snail--repl-go-back-target source-buf))
           (pop-to-buffer repl-buf))
       ;; run a new Julia REPL in a terminal and load the Snail server file
+      (unless julia-snail-port
+        (setq-local julia-snail-port (1+ julia-snail-port-counter))
+        (setq julia-snail-port-counter (1+ julia-snail-port-counter)))
       (julia-snail--start source-buf))))
 
 (defun julia-snail-send-line ()
