@@ -843,8 +843,7 @@ end
 end
 
 
-### Multimedia support
-## Adapted from a PR by https://github.com/dahtah (https://github.com/gcv/julia-snail/pull/21).
+### Multimedia display
 
 module Multimedia
 
@@ -1014,7 +1013,9 @@ function start(port=10011; addr="127.0.0.1")
         while running
             client = Sockets.accept(server_socket)
             push!(client_sockets, client)
+            
             @async while Sockets.isopen(client) && !eof(client)
+                # Parse input command
                 command = readline(client, keep=true)
                 input = nothing
                 expr = nothing
@@ -1024,7 +1025,7 @@ function start(port=10011; addr="127.0.0.1")
                     expr = Meta.parse(input.code)
                     current_reqid = input.reqid
                 catch err
-                    # probably a parsing error
+                    # Probably a parsing error
                     resp = elexpr([
                         Symbol("julia-snail--response-failure"),
                         input.reqid,
@@ -1075,8 +1076,9 @@ function start(port=10011; addr="127.0.0.1")
                         lock(Tasks.active_tasks_lock) do
                             delete!(Tasks.active_tasks, current_reqid)
                         end
-                    end # process input
-                end
+                    end
+                end # process input
+                
                 lock(Tasks.active_tasks_lock) do
                     Tasks.active_tasks[current_reqid] = active_task
                 end

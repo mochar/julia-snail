@@ -4,20 +4,23 @@ module ObJulia
 
 ### Display
 
-# Display utilities
 import Base.display
+
 struct ObJuliaDisplay <: AbstractDisplay
     io::IO
 end
+
 # Display fallback for types we do not support
 function display(d::ObJuliaDisplay, Any, x; kwargs...)
     verbatim(d)
     show(d.io, x)
 end
+
 function display(d::ObJuliaDisplay, ::MIME"text/org", x; kwargs...)
     verbatim(d)
     show(d.io, MIME("text/plain"), x)
 end
+
 displayable(d::ObJuliaDisplay, M::MIME) = true
 
 display(d::ObJuliaDisplay, x) = display(d, MIME("text/org"), x)
@@ -25,7 +28,7 @@ display(d::ObJuliaDisplay, x) = display(d, MIME("text/org"), x)
 # Auto-Latexify
 
 function display(d::ObJuliaDisplay, ::MIME"text/org+latexify", x; kwargs...)
-    if ! isdefined(Main, :Latexify)
+    if !isdefined(Main, :Latexify)
         try
             @eval using Latexify
             OrgBabelReload()
@@ -47,8 +50,8 @@ function display(d::ObJuliaDisplay, ::MIME"text/org+latexify", x::T; kwargs...) 
 end
 
 ### Sexp
-
 # The heavy-lifting of converting types to elisp happens here
+
 "`string()` wrapper which escapes unsupported characters:
 - `|`s are replaced by `\\vert{}`
 - newlines are replaced by ` `"
@@ -58,7 +61,6 @@ function stringify(text)
            ('|' => "\\vert{}", "\n" => " "),
            init=string(text))
 end
-
 
 # TODO: instead of converting to string, convert them to a Sexp type,
 # so that we can modify it before converting to string
@@ -161,7 +163,7 @@ stringify(d::Union{Date,DateTime}) = inactive(d)
 
 display(d::ObJuliaDisplay, ::MIME"text/org", i::T;
         kwargs...) where T <: Union{Date,DateTime} =
-            verbatim(d, inactive(i))
+    verbatim(d, inactive(i))
 
 # days (d), weeks (w), months (m), or years (y)
 unit(x::Day) = "d"; unit(x::Week) = "w"; unit(x::Month) = "m"; unit(x::Year) = "y";
@@ -184,29 +186,28 @@ const supported_packages = [
     :Latexify, :LaTeXStrings,
     :Gadfly, :Plots, :Makie, :CairoMakie, :GLMakie, :WGLMakie]
 
-const package_mimes =
-    Dict(:Plots => MIME.(["image/gif",
-                    "image/png",
-                    "image/svg+xml",
-                    "application/pdf",
-                    "application/postscript",
-                    "image/eps",
-                    "application/x-tex",
-                    "text/html"]),
-         :GadFly => MIME.(["application/postscript",
-                     "application/pdf",
+const package_mimes = Dict(
+    :Plots => MIME.(["image/gif",
                      "image/png",
-                           "image/svg+xml"]),
-        :Makie => MIME.(["image/png",
                      "image/svg+xml",
                      "application/pdf",
                      "application/postscript",
                      "image/eps",
-                         "text/html"]),
-        :GLMakie => MIME.(["image/png"]),
-        :WGLMakie => MIME.(["text/html"])
-    )
-
+                     "application/x-tex",
+                     "text/html"]),
+    :GadFly => MIME.(["application/postscript",
+                      "application/pdf",
+                      "image/png",
+                      "image/svg+xml"]),
+    :Makie => MIME.(["image/png",
+                     "image/svg+xml",
+                     "application/pdf",
+                     "application/postscript",
+                     "image/eps",
+                     "text/html"]),
+    :GLMakie => MIME.(["image/png"]),
+    :WGLMakie => MIME.(["text/html"])
+)
 
 "Call define_\$pkg function."
 define_package_functions(pkg::Symbol) = (@eval $pkg)()
@@ -328,19 +329,19 @@ function define_Makie()
     @eval display(d::ObJuliaDisplay, mime::M, p::Main.Makie.FigureAxisPlot; kwargs...) where
     { M <: Union{MIME"image/png", MIME"image/svg+xml", MIME"application/pdf", MIME"application/postscript",
                  MIME"image/eps", MIME"text/html"}}=
-                     show(d.io, mime, p)
+              show(d.io, mime, p)
                      
     @eval display(d::ObJuliaDisplay, mime::M, p::Main.Makie.Figure; kwargs...) where
     { M <: Union{MIME"image/png", MIME"image/svg+xml", MIME"application/pdf", MIME"application/postscript",
                  MIME"image/eps", MIME"text/html"}}=
-                     show(d.io, mime, p)
+              show(d.io, mime, p)
 
     # Fallback to org verbatim text if no graphical MIME is requested
     @eval display(d::ObJuliaDisplay, mime::MIME"text/org", p::Main.Makie.FigureAxisPlot; kwargs...) =
-        (verbatim(d); show(d.io, MIME("text/plain"), p))
+              (verbatim(d); show(d.io, MIME("text/plain"), p))
         
     @eval display(d::ObJuliaDisplay, mime::MIME"text/org", p::Main.Makie.Figure; kwargs...) =
-        (verbatim(d); show(d.io, MIME("text/plain"), p))
+              (verbatim(d); show(d.io, MIME("text/plain"), p))
 end
 
 function define_CairoMakie() define_Makie() end
