@@ -455,18 +455,24 @@ MODULE can be:
 - nil, which returns [:Main]
 - an Elisp keyword, which returns [<keyword>], including the
   leading colon in the keyword
+- an Elisp string, which is split by dot and converted to Julia array literal
 - an Elisp list, which can contain either keywords or strings,
   and which is converted to a Julia array literal with the
   entries of the input list converted to Julia keywords"
-  (cond ((null module) "[:Main]")
-        ((keywordp module) (format "[%s]" module))
-        ((listp module) (format
-                         "[%s]"
-                         (s-join " " (-map (lambda (s)
-                                             (if (keywordp s)
-                                                 (format "%s" s)
-                                               (format ":%s" s)))
-                                           module))))
+  (cond ((null module)
+         "[:Main]")
+        ((keywordp module)
+         (format "[%s]" module))
+        ((stringp module)
+         (julia-snail--construct-module-path (split-string module "\\.")))
+        ((listp module)
+         (format
+          "[%s]"
+          (s-join " " (-map (lambda (s)
+                              (if (keywordp s)
+                                  (format "%s" s)
+                                (format ":%s" s)))
+                            module))))
         (t (error "Malformed module specification"))))
 
 (defmacro julia-snail--with-syntax-table (&rest body)
@@ -1100,22 +1106,22 @@ nil, wait for the result and return it."
     (puthash reqid
              (make-julia-snail--request-tracker
               :repl-buf repl-buf
-              :originating-buf originating-buf
+              :origin-buf origin-buf
               :display-error-buffer-on-failure? display-error-buffer-on-failure?
               :callback-success (lambda (request-info &optional data)
                                   (unless async
                                     (setq res (or data :nothing)))
                                   (when callback-success
-                                    (with-current-buffer originating-buf
+                                    (with-current-buffer origin-buf
                                       (funcall callback-success request-info data))))
               :callback-failure (lambda (request-info)
                                   (unless async
                                     (setq res :nothing))
                                   (when callback-failure
-                                    (with-current-buffer originating-buf
+                                    (with-current-buffer origin-buf
                                       (funcall callback-failure request-info)))))
              julia-snail--requests)
-    ;; return value logic:
+
     (if async
         reqid
       ;; XXX: Non-async (i.e. synchronous) server requests need to poll the
@@ -1137,7 +1143,7 @@ nil, wait for the result and return it."
                              (format "Snail error: %s" wait-result))))
             (when callback-failure
               (funcall callback-failure))
-            (with-current-buffer originating-buf
+            (with-current-buffer origin-buf
               (spinner-stop))
             (error error-msg)))))))
 
@@ -1235,7 +1241,7 @@ evaluated in the context of MODULE."
       (when-let (tmpfile (julia-snail--request-tracker-tmpfile request-info))
         (delete-file tmpfile))
       ;; stop spinner
-      (with-current-buffer (julia-snail--request-tracker-originating-buf request-info)
+      (with-current-buffer (julia-snail--request-tracker-origin-buf request-info)
         (spinner-stop))
       ;; remove request ID from requests hash
       (remhash reqid julia-snail--requests))))
