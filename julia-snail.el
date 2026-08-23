@@ -1345,7 +1345,7 @@ evaluated in the context of MODULE."
           (forward-char)))))))
 
 ;; TODO When we implement passing source (stdout/stderr), encode stderr text with red face
-(defun julia-snail--stream (reqid chunk)
+(defun julia-snail--stream (reqid type chunk)
   (when-let* ((req (gethash reqid julia-snail--requests))
               (data (julia-snail--request-tracker-data req))
               (buf (julia-snail--request-data-stream-buf data)))

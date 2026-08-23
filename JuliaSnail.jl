@@ -161,22 +161,23 @@ end
 
 ### Request stream
 
-# Individual requests should have their own independent stdout/stderr so that we
-# can show it next to the request source (org src block or code region). However
-# in julia stdout and stderr are globals. The solution here is to redirect the
-# global stdout and stderr through a proxy that will check if we are in a
-# request. If so we use the request's io, otherwise the defaut one. To know if
-# we are in a request, a ScopedValue is set to the request's RequestStream
-# instance. Scoped values are inherited across threads within a task whereas
-# task local storage is not.
+# Individual requests should have their own independent stdout/stderr streams so
+# that we can show it next to the request source (org src block or source code
+# overlay). However in julia stdout and stderr are globals. The solution here is
+# to redirect the global stdout and stderr through a proxy that will check if we
+# are in a request. If so we use the request's stdout/stderr stream, otherwise
+# the defaut one. To know if we are in a request, a ScopedValue is set to the
+# request's Request instance. Scoped values are inherited across threads within
+# a task whereas task local storage is not.
 
 @kwdef struct RequestStream <: IO
     client::TCPSocket
     reqid::String
-    redirect::Bool
-    buffer::IOBuffer = IOBuffer() # stdout/stderr buffer
-    babel::Union{NamedTuple, Nothing} = nothing
-    lock::ReentrantLock = ReentrantLock() # Thread safety when multiple threads spawned in a task
+    "Output stream, one of :stdout or :stderr"
+    type::Symbol
+    buffer::IOBuffer = IOBuffer()
+    "Thread safety lock when multiple threads spawned in a task try to write to buffer."
+    lock::ReentrantLock = ReentrantLock() 
 end
 
 function Base.unsafe_write(s::RequestStream, p::Ptr{UInt8}, n::UInt)
@@ -194,7 +195,7 @@ function Base.flush(s::RequestStream)
     lock(s.lock) do
         if s.buffer.size > 0
             chunk = String(take!(s.buffer))
-            resp = elexpr([Symbol("julia-snail--stream"), s.reqid, chunk])
+            resp = elexpr([Symbol("julia-snail--stream"), s.reqid, repr(s.type), chunk])
             println(s.client, resp)
         end
     end
@@ -204,19 +205,49 @@ end
 Base.isopen(s::RequestStream) = isopen(s.client)
 Base.get(s::RequestStream, key::Symbol, default) = key === :color ? true : default
 
-const CURRENT_REQUEST_STREAM = ScopedValue{Union{Nothing, RequestStream}}(nothing)
+### Request struct
 
-# Global proxy
+# println(stream.client, "x"): Write to socket directly, should be elisp expr
+# println(stream.stdout, "x"): Write to buffered stream, send as stream string
+
+@kwdef mutable struct Request
+    client::TCPSocket
+    reqid::String
+    "Namedtuple with fields 'params' and 'output_file'."
+    babel::Union{NamedTuple, Nothing} = nothing
+    "Whether or not to redirect stdout and stderr."
+    redirect::Bool
+    stdout::RequestStream
+    stderr::RequestStream
+end
+
+const CURRENT_REQUEST = ScopedValue{Union{Request, Nothing}}(nothing)
+
+### Global stdout/stderr proxy
+
+"""
+Replaces the global Base.stdout and Base.stderr objects.
+
+Will relay to CURRENT_REQUEST.{stdout/stderr} if the scoped value is set,
+otherwise to the original Base.stdout and Base.stderr.
+"""
 struct SnailProxyIO <: IO
+    "One of Base.stdout or Base.stderr"
     orig_io::IO
+    "Output stream, one of :stdout or :stderr"
+    type::Symbol
 end
 
 @inline function _get_snail_io(proxy::SnailProxyIO)
-    stream = CURRENT_REQUEST_STREAM[]
-    return stream !== nothing && stream.redirect ? stream : proxy.orig_io
+    request = CURRENT_REQUEST[]
+    if request === nothing || !request.redirect
+        return proxy.orig_io
+    end
+    return proxy.type == :stdout ? request.stdout : request.stderr
 end
 
-Base.unsafe_write(proxy::SnailProxyIO, p::Ptr{UInt8}, n::UInt) = Base.unsafe_write(_get_snail_io(proxy), p, n)
+Base.unsafe_write(proxy::SnailProxyIO, p::Ptr{UInt8}, n::UInt) =
+    Base.unsafe_write(_get_snail_io(proxy), p, n)
 Base.write(proxy::SnailProxyIO, x::UInt8) = write(_get_snail_io(proxy), x)
 Base.flush(proxy::SnailProxyIO) = flush(_get_snail_io(proxy))
 Base.isopen(proxy::SnailProxyIO) = isopen(_get_snail_io(proxy))
@@ -256,7 +287,7 @@ is equivalent to
 Main.One.Two.Three.eval(:(x = 3 + 5))
 ```
 """
-function eval_in_module(fully_qualified_module_name::Array{Symbol}, expr::Union{Symbol, Expr}, request_stream::Union{RequestStream, Nothing}=nothing)
+function eval_in_module(fully_qualified_module_name::Array{Symbol}, expr::Union{Symbol, Expr}, request::Union{Request, Nothing}=nothing)
     # Work around Julia top-level loading requirements for certain forms; also:
     # https://github.com/gcv/julia-snail/pull/78
     if isa(expr, Expr) && expr.head == :block
@@ -298,12 +329,13 @@ function eval_in_module(fully_qualified_module_name::Array{Symbol}, expr::Union{
     end
    
     # go
-    if request_stream === nothing
+    if request === nothing
         return Core.eval(fqm, expr)
     else
-        @with CURRENT_REQUEST_STREAM => request_stream begin
+        @with CURRENT_REQUEST => request begin
             res = Core.eval(fqm, expr)
-            flush(request_stream)
+            flush(request.stdout)
+            flush(request.stderr)
             res
         end
     end
@@ -843,40 +875,48 @@ end
 
 module Multimedia
 
+using Match
 import Base64
+import ..CURRENT_REQUEST
 
 struct EmacsDisplay <: Base.AbstractDisplay
 end
 
 const EMACS = EmacsDisplay()
 
-function send(img_encoded)
-    reqid = get(task_local_storage(), :snail_reqid, nothing)
-    el = Main.JuliaSnail.elexpr([
-        Symbol("julia-snail-multimedia-display"),
-        img_encoded,
-        reqid
-    ])
-    Main.JuliaSnail.send_to_client(el)
-end
+const SUPPORTED_MIMES = ["image/png", "image/svg+xml"]
 
-function Base.display(d::EmacsDisplay, ::MIME{Symbol("image/png")}, img_raw)
-    send(Base64.stringmime("image/png", img_raw))
-end
+function Base.display(d::EmacsDisplay, mime::MIME, img)
+    string(mime) in SUPPORTED_MIMES || throw(MethodError(Base.display, (d, mime, img)))
+    
+    request = CURRENT_REQUEST[]
 
-function Base.display(d::EmacsDisplay, ::MIME{Symbol("image/svg+xml")}, img_raw)
-    send(Base64.base64encode(repr("image/svg+xml", img_raw)))
+    if request === nothing
+        throw(MethodError(Base.display, (EMACS, mime, img)))
+    elseif request.babel === nothing
+        img_encoded = Base64.base64encode(show, mime, img)
+        el = Main.JuliaSnail.elexpr([
+            Symbol("julia-snail-multimedia-display"),
+            img_encoded,
+            request.reqid
+        ])
+        println(request.client, el)
+    else
+        output_file = request.bable.output_file
+        open(output_file, "w") do io
+            show(io, mime, img)
+        end
+        println(request.stdout, "[[file:$(output_file)]]")        
+    end
 end
 
 function Base.display(d::EmacsDisplay, img)
-    supported = ["image/png", "image/svg+xml"]
-    for imgtype in supported
-        if showable(imgtype, img)
-            display(d, imgtype, img)
+    for mime in SUPPORTED_MIMES
+        if showable(mime, img)
+            display(d, MIME(mime), img) 
             return
         end
     end
-    # no dice
     throw(MethodError(Base.display, (d, img)))
 end
 
@@ -998,13 +1038,13 @@ function start(port=10011; addr=ip"127.0.0.1")
     CST.forcecompile()
 
     # Replace stdout and stderr with our proxy. This detects if we are currently
-    # in a request using CURRENT_REQUEST_STREAM, which is a scoped variable. If
-    # we are not in a request, it falls back to using the default stdout/stderr.
+    # in a request using CURRENT_REQUEST, which is a scoped variable. If we are
+    # not in a request, it falls back to using the default Base stdout/stderr.
     if !isa(stdout, SnailProxyIO)
-        Base.eval(Base, :(stdout = $SnailProxyIO($stdout)))
+        Base.eval(Base, :(stdout = $SnailProxyIO($stdout, :stdout)))
     end   
     if !isa(stderr, SnailProxyIO)
-        Base.eval(Base, :(stderr = $SnailProxyIO($stderr)))
+        Base.eval(Base, :(stderr = $SnailProxyIO($stderr, :stderr)))
     end   
 
     server_task = @async begin
@@ -1084,15 +1124,17 @@ Process the payload of a single request.
 function process_request(client::TCPSocket, payload::NamedTuple, code::Expr)
     # @info "Payload" payload
     reqid = payload.reqid
-    request_stream = RequestStream(
-        client=client,
+    request = Request(
         reqid=reqid,
+        client=client,
+        babel=payload.babel,
         redirect=payload.redirectio,
-        babel=payload.babel
+        stdout=RequestStream(client=client, reqid=reqid, type=:stdout),
+        stderr=RequestStream(client=client, reqid=reqid, type=:stderr),
     )
                
     try
-        result = eval_in_module(payload.ns, code, request_stream)
+        result = eval_in_module(payload.ns, code, request)
         resp = elexpr([Symbol("julia-snail--response-success"), reqid, result])
         println(client, resp)
     catch err
