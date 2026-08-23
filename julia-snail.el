@@ -328,6 +328,7 @@ nil means disable Snail-specific imenu integration (fall back on julia-mode impl
   (callback-success (lambda (&optional _data) (message "Snail command succeeded")))
   (callback-failure (lambda () (message "Snail command failed")))
   (display-error-buffer-on-failure? t)
+  babel-props
   data
   srcbuf-ov
   tmpfile
@@ -1065,7 +1066,8 @@ wait for the REPL prompt to return, otherwise return immediately."
      (async-poll-interval 20)
      (async-poll-maximum julia-snail-async-timeout)
      (display-error-buffer-on-failure? t)
-     (redirect-io t)
+     babel-props
+     (redirect-io :unspecified)
      (origin-buf (current-buffer))
      srcbuf-ov
      callback-success
@@ -1084,17 +1086,29 @@ nil, wait for the result and return it."
          (display-code-str (if julia-snail-debug
                                code-str
                              (s-truncate 80 code-str)))
+         (babel-str (if babel-props
+                        (json-encode-string
+                         (format "(params = %s, output_file = %S)"
+                                 (julia-snail-ob-params->named-tuple
+                                  (plist-get babel-props :params))
+                                 (plist-get babel-props :output-file)))
+                      "nothing"))
+         (redirect-io (if (eq redirect-io :unspecified)
+                          (null babel-props)
+                        (if redirect-io t nil)))
          (redirect-io-str (if redirect-io "true" "false"))
-         (msg (format "(ns = %s, reqid = \"%s\", code = %s, redirectio = %s)\n"
+         (msg (format "(ns = %s, reqid = \"%s\", code = %s, babel = %s, redirectio = %s)\n"
                       module-ns
                       reqid
                       code-str
+                      babel-str
                       redirect-io-str
                       ))
-         (display-msg (format "(ns = %s, reqid = \"%s\", code = %s, redirectio = %s)\n"
+         (display-msg (format "(ns = %s, reqid = \"%s\", code = %s, babel = %s, redirectio = %s)\n"
                               module-ns
                               reqid
                               display-code-str
+                              babel-str
                               redirect-io-str))
          (res-sentinel (gensym))
          (res res-sentinel))

@@ -81,7 +81,6 @@ LaTeX environment used in the result to `equation'. See also
 (add-to-list 'org-babel-tangle-lang-exts '("julia" . "jl"))
 
 ;;;; Org functions
-;; Argument handling, error display etc
 
 (defun julia-snail-ob-params->named-tuple (params)
   "Takes the arguments in PARAMS that needs to be processed by
@@ -117,64 +116,12 @@ equivalents."
                       (param->julia :file-ext))
                      ", ")))
 
-(defvar julia-snail-ob--async-map '()
-  "Association list between async block uuids and its requried info (evaluation params, buffer).")
-
 (defun julia-snail-ob-prepare-format-call (src-file out-file params &optional uuid)
   "Format a call to OrgBabelEval."
   (format
    "ObJulia.OrgBabelEval(%S,%S,%S,%s);"
    src-file out-file (julia-snail-ob-params->named-tuple params)
    (or (when uuid (format "%S" uuid)) "nothing")))
-
-(defun julia-snail-ob--get-create-trace-buffer ()
-  (get-buffer-create "*ob-julia-stacktrace*"))
-
-(defun julia-snail-ob--make-trace-buffer (&optional do-not-pop)
-  (let ((buf (julia-snail-ob--get-create-trace-buffer)))
-    (with-current-buffer buf
-      (special-mode)
-      (let ((inhibit-read-only t))
-        (erase-buffer)))
-    (unless do-not-pop
-      (pop-to-buffer buf))
-    buf))
-
-(defun julia-snail-ob--async-get-remove (uuid)
-  "Get UUID from the list of async processes, remove it from
-  the list and return its value."
-  (let ((el (assoc uuid julia-snail-ob--async-map)))
-    (setq julia-snail-ob--async-map (delq el julia-snail-ob--async-map))
-    el))
-
-(defun julia-snail-ob--async-add (uuid properties)
-  "Register the async background block, identified by UUID with
-properties PROPERTIES."
-  (setq julia-snail-ob--async-map
-        (cons `(,uuid . ,properties) julia-snail-ob--async-map)))
-
-(defun julia-snail-ob--trace-file (output-file)
-  (concat output-file ".trace"))
-
-(defun julia-snail-ob--has-stacktrace (output-file)
-  (file-exists-p (julia-snail-ob--trace-file output-file)))
-
-(defun julia-snail-ob-create-stacktrace-buffer (stacktrace-file &optional do-not-pop)
-  "Display the stacktrace in a new buffer"
-  (let ((buf (julia-snail-ob--make-trace-buffer do-not-pop)))
-    (with-current-buffer buf
-      (let ((inhibit-read-only t))
-        (insert-file-contents stacktrace-file)))))
-
-(defun julia-snail-ob-dispatch-output-type (params output-file &optional async)
-  ;; First, we have the special case in which the output is a
-  ;; stacktrace.  If there's one, open it in a buffer, then continue
-  ;; showing the results.
-  (when (julia-snail-ob--has-stacktrace output-file)
-    ;; TODO: jump to the corresponding src line?
-    (julia-snail-ob-create-stacktrace-buffer
-     (julia-snail-ob--trace-file output-file) (when async -1)))
-  (julia-snail-ob-process-results params output-file))
 
 (defun org-babel-edit-prep:julia (info)
   (let ((session (cdr (assq :session (nth 2 info)))))
@@ -184,18 +131,22 @@ properties PROPERTIES."
       (julia-snail-ob-initiate-session session nil))))
 
 (defun org-babel-expand-body:julia (body params)
-  "Expand BODY according to PARAMS.  Return the expanded body, a
-  string containing the julia we need to evaluate, possibly
-  wrapped in a let block with variable assignmenetns."
+  "Expand BODY according to PARAMS.
+Return the expanded body, a string containing the Julia code we need to
+evaluate, possibly wrapped in a let block with variable assignments."
   (let ((block (and (alist-get :let params) "let"))
         (vars (mapconcat
                'concat (org-babel-variable-assignments:julia params) ";")))
     (concat
+     "begin"
      ;; no newline between vars and body
      ;; so that the stacktrace line is aligned
      block " " vars "; " body
      ";\n"
-     (if block "end\n" ""))))
+     (if block "end\n" "")
+     "end"
+     )
+    ))
 
 (defun julia-snail-ob-output-file (file &optional extension)
   "Return the a path where Julia should store its results.
@@ -242,11 +193,12 @@ table. To force a matrix, use matrix"
      ((member "html" results) "html")
      ((member "latex" results) "tex")
      ((member "org" results) "org")
-     ;; ((member "graphcis" results) "")
+     ;; ((member "graphics" results) "")
      (t "org"))))
 
 (defun julia-snail-ob-process-results (params output-file)
-  "Decides what to insert as result."
+  "Returns processed OUTPUT-FILE contents, or if image, return OUTPUT-FILE
+and modify PARAMS to reflect this."
   (let ((result-type (julia-snail-ob-parse-result-type params))
         (file (alist-get :file params))
         (res (alist-get :results params)))
@@ -260,15 +212,19 @@ table. To force a matrix, use matrix"
                   (prog1 output-file
                     (setf (alist-get :file params) output-file)
                     (push "file" (alist-get :result-params params)))
+                
                 ;; Else format result for display
                 (delete-file output-file)
                 (goto-char (point-min))
-                (let* ((suggested-type (buffer-substring-no-properties
+                (let* (;; ObJulia.jl adds the suggested type in the first line
+                       ;; of the output file.
+                       (suggested-type (buffer-substring-no-properties
                                         (point) (line-end-position)))
                        (result-as-returned
                         (buffer-substring-no-properties
                          (progn (forward-line 1) (point))
                          (point-max)))
+                       
                        ;; ;TODO: Is there any edge case this older version handles?
                        ;; (content (split-string
                        ;;           (buffer-substring-no-properties
@@ -282,10 +238,12 @@ table. To force a matrix, use matrix"
 
                        ;; Either enforce the result-type requested by the
                        ;; user, or use the one provided by julia if 'auto
+                       ;; TODO Shouldn't suggested-type be interned as it
+                       ;; is a string (pcase below assumes symbol), though
+                       ;; it falls back on the same result anyways.
                        (result-type (if (eq result-type 'auto)
                                         suggested-type
                                       result-type)))
-                  ;; Dispatch processing of result based on result-type
                   (pcase result-type
                     ;; ('table
                     ;;  ;; Add hline
@@ -424,28 +382,42 @@ Session can be:
                (concat "julia " session))))
     name))
 
-(defun julia-snail-ob--place-result (output-file org-buffer uuid params)
-  "Place org-babel result in OUTPUT-FILE in ORG-BUFFER.
+(defun julia-snail-ob-get-module-str (params)
+  ;; TODO Need some type of validation
+  (let ((module (alist-get :module params)))
+    (cond
+     ;; Default to Main
+     ((or (null module) (string-empty-p module))
+      "Main")
+     ;; Idea here is that i mainly intend to use Main.X modules.
+     ;; So prefixing with "Main." would be cumbersome.
+     ;; But this does mean this will fail for anything non-main.
+     ((not (s-starts-with-p "Main" module))
+      (concat "Main." module))
+     (t
+      module))))
 
-PARAMS are the parameters of evaluation and UUID identifies the
+(defun julia-snail-ob--place-result (result org-buffer reqid params)
+  "Place org-babel RESULT in ORG-BUFFER.
+
+PARAMS are the parameters of evaluation and REQID identifies the
 source block."
   (save-window-excursion
     (switch-to-buffer org-buffer)
     (save-excursion
       (save-restriction
-      	;; If it's narrowed, substitution would fail
-        (widen)
-      	;; search the matching src block
+        (widen) ;; Otherwise substitution may fail
       	(goto-char (point-max))
-      	(when (search-backward (concat "julia-async:" uuid) nil t)
-      	  ;; remove uuid string if result-type is raw, as ob-core doesn't do it
+      	(when (search-backward (concat "julia-async:" reqid) nil t)
+      	  ;; Remove reqid string if result-type is raw, as ob-core doesn't do it
           (when (member "raw" (alist-get :result-params params))
             (delete-region (match-beginning 0) (match-end 0)))
-          ;; remove results
+          ;; Remove results
       	  (search-backward "#+end_src")
-          ;; insert new one
+          ;; Insert new one
           (org-babel-insert-result
-           (julia-snail-ob-dispatch-output-type params output-file t)   ;=> result string
+           ;; (julia-snail-ob-process-results params output-file)    ;=> result string
+           result
            (alist-get :result-params params)                      ;=> result params
            (list nil nil params)                                  ;=> block info
            nil "julia")                                           ;=> hash and lang
@@ -521,17 +493,16 @@ Unless an output file is explicitly specified with the header arg
              new-output-file)
     output-file))
 
-(defun julia-snail-ob-evaluate-in-session:sync
-    (session OrgBabelEval-call _block output-file params)
-  "Run BODY in session SESSION synchronously."
+(defun julia-snail-ob-evaluate-in-session:sync (session module body output-file params)
+  "Run BODY in session SESSION synchronously, return (possibly modified) OUTPUT-FILE."
   (when-let ((mime-type
               (julia-snail--send-to-server
-                '("Main")
-                OrgBabelEval-call
+                module
+                body
                 :repl-buf (concat "*" session "*")
                 :async nil
+                :babel-props (list :params params :output-file output-file)
                 :display-error-buffer-on-failure? t
-                :redirect-io nil
                 )))
     ;; Rename the output file heuristically by mime-type
     (setq output-file (julia-snail-ob--maybe-rename-output output-file mime-type params))
@@ -539,85 +510,53 @@ Unless an output file is explicitly specified with the header arg
         output-file
       (error "No output produced."))))
 
-(defun julia-snail-ob-evaluate-in-session:async
-    (session uuid OrgBabelEval-call _block output properties)
-  "Run BODY in session SESSION asynchronously."
-  (let ((reqid 
-         (julia-snail--send-to-server
-           '("Main")
-           OrgBabelEval-call
-           :repl-buf (concat "*" session "*")
-           :async t
-           :display-error-buffer-on-failure? t
-           :redirect-io nil
-           :callback-success #'julia-snail-ob-success-callback
-           ;; Currently never called:
-           :callback-failure #'julia-snail-ob-failure-callback)))
-    (julia-snail-ob--async-add uuid properties)
-    (concat "julia-async:" uuid)))
+(defun julia-snail-ob-evaluate-in-session:async (session module body output-file params)
+  "Run BODY in session SESSION asynchronously, return placeholder string."
+  (let* ((reqid 
+          (julia-snail--send-to-server
+            module
+            body
+            :repl-buf (concat "*" session "*")
+            :async t
+            :display-error-buffer-on-failure? t
+            :babel-props (list :params params :output-file output-file)
+            :callback-success #'julia-snail-ob-success-callback
+            :callback-failure #'julia-snail-ob-failure-callback)))
+    (concat "julia-async:" reqid)))
 
-(defun julia-snail-ob-success-callback (request-info result-data)
+(defun julia-snail-ob-success-callback (request result-data)
   "A function that is called when julia-snail response is available."
   (if (not result-data)
       (message "Code block produced no output.")
-    (pcase-let ((`(,uuid-string . ,mime-type) (read result-data)))
-      (if (string-match ".*ob_julia_async_\\([0-9a-z\\-]+\\).*" uuid-string)
-          (let* ((uuid (match-string-no-properties 1 uuid-string))
-                 (org-buffer (julia-snail--request-tracker-originating-buf request-info))
-                 (display-errors (julia-snail--request-tracker-display-error-buffer-on-failure?
-                                  request-info))
-                 (properties (julia-snail-ob--async-get-remove uuid))
-                 (vals (cdr properties))
-                 (params (elt vals 0))
-                 (output-file (elt vals 1))
-                 ;; (org-buffer (elt vals 2))
-                 (src-file (elt vals 3)))
-            (unwind-protect
-                (progn
-                  ;; Rename the output file heuristically by mime-type
-                  (setq output-file
-                        (julia-snail-ob--maybe-rename-output output-file mime-type params))
-                  (julia-snail-ob--place-result output-file org-buffer uuid params))
-              (when (and src-file (file-exists-p src-file))
-                (delete-file src-file))))))))
+    (let* (
+           ;; (mime-type (read result-data))
+           (reqid (julia-snail--request-tracker-id request))
+           (org-buffer (julia-snail--request-tracker-origin-buf request))
+           (display-errors (julia-snail--request-tracker-display-error-buffer-on-failure?
+                            request))
+           (properties (julia-snail--request-tracker-babel-props request))
+           (params (plist-get properties :params))
+           (output-file (plist-get properties :output-file)))
+      ;; Rename the output file heuristically by mime-type
+      ;; (setq output-file
+      ;;       (julia-snail-ob--maybe-rename-output output-file mime-type params))
+      (julia-snail-ob--place-result result-data org-buffer reqid params))))
 
-;; NOTE: because we catch errors in ObJulia this is never actually called.
-;; TODO: Provide an option to not catch errors when using julia-snail?
-;; julia-snail's error reporting is pretty slick.
-;; NOTE: In that event, we can't access the UUID! Need to think more about this.
-(defun julia-snail-ob-failure-callback (request-info)
-  (when-let ((tmpfile (julia-snail--request-tracker-tmpfile request-info)))
+(defun julia-snail-ob-failure-callback (request)
+  (when-let ((tmpfile (julia-snail--request-tracker-tmpfile request)))
     (and (file-exists-p tmpfile) (delete-file tmpfile))))
-
-(defun julia-snail-ob-evaluate-in-session
-  (session block OrgBabelEval-call uuid params output-file org-buffer src-file)
-  "Evaluate BLOCK in session SESSION, starting it if necessary.
-If UUID is provided, run the block asynchronously."
-  ;; If the session does not exists, start it
-  (when (not (julia-snail-ob--get-live-session session))
-    (org-babel-prep-session:julia session params))
-  (if uuid
-      (julia-snail-ob-evaluate-in-session:async
-       session uuid OrgBabelEval-call block output-file
-       (list params output-file org-buffer src-file))
-    (unwind-protect
-        (julia-snail-ob-dispatch-output-type
-         params
-         (julia-snail-ob-evaluate-in-session:sync
-          session OrgBabelEval-call block output-file params))
-      (when (and src-file (file-exists-p src-file))
-        (delete-file src-file)))))
 
 (defun julia-snail-ob--maybe-make-raw (params)
   "Conditionally change the result type to \"raw\" if the \"latexify\"
-header argument is present.
+header argument is present, returns (modified) params either way.
 
 Note: PARAMS is modified in the process."
   (when-let* ((latexify (alist-get :latexify params))
               ((not (equal latexify "no"))))
     (message "LaTeX output requested, ignoring result type!")
     (cl-callf (lambda (v) (nconc v '("raw")))
-        (alist-get :result-params params))))
+        (alist-get :result-params params)))
+  params)
 
 ;; Main entry point when code is evaluated in an Org Mode buffer
 (defun org-babel-execute:julia (block params)
@@ -625,35 +564,39 @@ Note: PARAMS is modified in the process."
 
 BLOCK is the content of the src block
 PARAMS are the parameter passed to the block"
-  ;; Save excursion as we might open new buffers (e.g. stacktrace)
   ;; TODO: if the block already has a julia-async link, it would be
   ;; nice to interrupt it and start the new one.
-  (save-excursion
-    (let* ((org-buffer (current-buffer))
-           (session (julia-snail-ob-get-session-name params))
-           (body (org-babel-expand-body:julia block params))
-           (src-file (make-temp-file "ob-julia-" nil ".jl" body))
-           (out-format (or (julia-snail-ob-parse-output-extension params)
-                           (bound-and-true-p org-export-current-backend)))
-           ;; TODO Change this to reqid?
-           (uuid (and (julia-snail-ob-async-p params) (org-id-uuid)))
-           (output-file
-            (julia-snail-ob-output-file
-             (unless (cl-intersection '("link" "graphics")
-                                      (alist-get :result-params params)
-                                      :test #'equal)
-               (alist-get :file params))
-             out-format))
-           (OrgBabelEval-call
-            (julia-snail-ob-prepare-format-call
-             src-file output-file params uuid)))
-      ;; Modify params in place as specified by header-args:
-      (julia-snail-ob--maybe-make-raw params) ; Handle latexify header arg
-      (julia-snail-ob--ensure-module session params) ; Handle module
-      ;; Evaluate block
-      (julia-snail-ob-evaluate-in-session
-       session block
-       OrgBabelEval-call uuid params output-file org-buffer src-file))))
+  (let* ((params (julia-snail-ob--maybe-make-raw params))
+         (session (julia-snail-ob-get-session-name params))
+         (module (julia-snail-ob-get-module-str params))
+         (body (org-babel-expand-body:julia block params))
+         (out-ext (or (julia-snail-ob-parse-output-extension params)
+                      (bound-and-true-p org-export-current-backend)))
+         (output-file
+          (julia-snail-ob-output-file
+           (unless (cl-intersection '("link" "graphics")
+                                    (alist-get :result-params params)
+                                    :test #'equal)
+             (alist-get :file params))
+           out-ext))
+         (babel-params (julia-snail-ob-params->named-tuple params)))
+
+    ;; If the session does not exists, start it
+    (when (not (julia-snail-ob--get-live-session session))
+      (org-babel-prep-session:julia session params))
+
+    ;; Ensure module exists
+    (julia-snail-ob--ensure-module session params)
+
+    (if (julia-snail-ob-async-p params)
+        ;; Async execution
+        (julia-snail-ob-evaluate-in-session:async
+         session module body output-file params)
+      ;; Sync execution
+      (julia-snail-ob-process-results
+       params
+       (julia-snail-ob-evaluate-in-session:sync
+        session module body output-file params)))))
 
 ;;;; Org interaction
 
@@ -661,8 +604,9 @@ PARAMS are the parameter passed to the block"
   (when-let* ((info (or info (org-babel-get-src-block-info 'no-eval)))
               (_ (string-equal (nth 0 info) "julia"))
               (params (nth 2 info))
-              (session (julia-snail-ob-get-session-name params)))
-    (cons session (alist-get :module params))))
+              (session (julia-snail-ob-get-session-name params))
+              (module (julia-snail-ob-get-module-str params)))
+    (cons session module)))
 
 (cl-defmethod julia-snail--module-at-point
   (&context (major-mode org-mode) &optional partial-module)

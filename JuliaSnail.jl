@@ -63,12 +63,13 @@ end
 import Markdown
 import Printf
 import REPL
-import Sockets
 import REPL.REPLCompletions
 using Base.ScopedValues: ScopedValue, @with
+using Sockets
+using Logging
+using Match
 
 export start, stop
-
 
 ### Configuration
 
@@ -81,7 +82,7 @@ set!(var, val) = Base.eval(Main.JuliaSnail.Conf, :($var = $val))
 end
 
 
-### Elisp s-expression constructor
+### Elisp s-expression
 
 struct ElispKeyword
     kw::Symbol
@@ -108,27 +109,23 @@ function elexpr(arg::Array)
     Printf.@sprintf("(%s)", join(map(elexpr, arg), " "))
 end
 
-function elexpr(arg::String)
+function elexpr(arg::AbstractString)
     Printf.@sprintf("\"%s\"", escape_string(arg))
 end
 
-function elexpr(arg::Markdown.MD)
-    elexpr(string(arg))
-end
+elexpr(arg::Markdown.MD) = elexpr(string(arg))
 
-function elexpr(arg::Number)
-    arg
-end
+elexpr(arg::Number) = arg
 
-function elexpr(arg::Symbol)
-    string(arg)
-end
+elexpr(arg::Symbol) = string(arg)
 
-function elexpr(arg::Bool)
-    arg ? "t" : "nil"
-end
+elexpr(arg::Bool) = arg ? "t" : "nil"
+
+elexpr(arg::Nothing) = "nil"
 
 function elexpr(arg::Any)
+    @warn "Type $(typeof(arg)) cannot be converted to elexpr, set to nil" arg
+    # display(stacktrace())
     "nil"
 end
 
@@ -137,7 +134,7 @@ function elexpr(arg::ElispKeyword)
 end
 
 
-### Emacs popup display helper
+### Emacs popup display
 
 module PopupDisplay
 
@@ -162,7 +159,7 @@ end
 
 end
 
-### Request stream code
+### Request stream
 
 # Individual requests should have their own independent stdout/stderr so that we
 # can show it next to the request source (org src block or code region). However
@@ -173,15 +170,14 @@ end
 # instance. Scoped values are inherited across threads within a task whereas
 # task local storage is not.
 
-struct RequestStream <: IO
-    client
+@kwdef struct RequestStream <: IO
+    client::TCPSocket
     reqid::String
     redirect::Bool
-    buffer::IOBuffer
-    lock::ReentrantLock # Thread safety when multiple threads spawned in a task
+    buffer::IOBuffer = IOBuffer() # stdout/stderr buffer
+    babel::Union{NamedTuple, Nothing} = nothing
+    lock::ReentrantLock = ReentrantLock() # Thread safety when multiple threads spawned in a task
 end
-
-RequestStream(client, reqid, redirect) = RequestStream(client, reqid, redirect, IOBuffer(), ReentrantLock())
 
 function Base.unsafe_write(s::RequestStream, p::Ptr{UInt8}, n::UInt)
     lock(s.lock) do
@@ -199,7 +195,7 @@ function Base.flush(s::RequestStream)
         if s.buffer.size > 0
             chunk = String(take!(s.buffer))
             resp = elexpr([Symbol("julia-snail--stream"), s.reqid, chunk])
-            send_to_client(resp, s.client)
+            println(s.client, resp)
         end
     end
     return nothing
@@ -237,8 +233,7 @@ function (r::Base.RedirectStdStream)(proxy::SnailProxyIO)
     return proxy
 end
 
-
-### Evaluation helpers for Julia code coming in from Emacs
+### Evaluation
 
 struct UndefinedModule <: Exception
     name::Symbol
@@ -261,12 +256,13 @@ is equivalent to
 Main.One.Two.Three.eval(:(x = 3 + 5))
 ```
 """
-function eval_in_module(fully_qualified_module_name::Array{Symbol}, expr::Union{Symbol, Expr}; request_stream::Union{RequestStream, Nothing}=nothing)
+function eval_in_module(fully_qualified_module_name::Array{Symbol}, expr::Union{Symbol, Expr}, request_stream::Union{RequestStream, Nothing}=nothing)
     # Work around Julia top-level loading requirements for certain forms; also:
     # https://github.com/gcv/julia-snail/pull/78
     if isa(expr, Expr) && expr.head == :block
         expr.head = :toplevel
     end
+    
     # Retrieving the first module in the chain can be tricky. In general, using
     # getfield to find a module works, but packages loaded as transitive
     # dependencies are not necessarily loaded into Main, and so must be found
@@ -411,7 +407,7 @@ function split_name(name::String, ns::Module=Main)
 end
 
 
-### Introspection helpers
+### Introspection
 
 """
 Return names of modules and identifiers in the given namespace.
@@ -912,11 +908,16 @@ end
 
 end
 
-### Org babel support
+### Org babel
 
-include("ObJulia.jl")
+# include("ObJulia.jl")
 
-### Extras: support for extending Snail
+module ObJulia
+
+end
+
+
+### Extensions
 
 module Extensions
 
@@ -932,7 +933,7 @@ end
 end
 
 
-### Task handling code
+### Task handling
 
 module Tasks
 
@@ -954,11 +955,12 @@ end
 end
 
 
-### Server code
+### Server
 
-running = false
-server_socket = nothing
-client_sockets = []
+server::Union{Sockets.TCPServer, Nothing} = nothing
+server_task::Union{Task, Nothing} = nothing
+server_stop_flag = Threads.Atomic{Bool}(false)
+clients = TCPSocket[]
 
 """
 Start the Snail server.
@@ -966,27 +968,20 @@ Start the Snail server.
 The server starts a server socket and waits for connections. Connections listen
 for commands coming in from clients (i.e., Emacs). Commands are parsed,
 dispatched, and evaluated as needed.
-
-Standard output and standard error during evaluation go into the REPL. Errors
-during evaluation are captured and sent back to the client as Elisp
-s-expressions. Special queries also write back their responses as s-expressions.
 """
-function start(port=10011; addr="127.0.0.1")
-    global running = false
-    global server_socket = Sockets.listen(Sockets.IPv4(addr), port)
-    let wait_result = timedwait(function(); server_socket.status == Base.StatusActive; end,
-        5.0)
-        if :timedout == wait_result
-            println(stderr, "ERROR: Timeout while waiting to open server socket for Snail.")
-            println(stderr, "ERROR: Snail will not work correctly.")
-        elseif :error == wait_result
-            println(stderr, "ERROR: Timeout while waiting to open server socket for Snail.")
-            println(stderr, "ERROR: Snail will not work correctly.")
-        elseif :ok == wait_result
-            running = true
-        else
-            println(stderr, "ERROR: Something broke spectacularly.")
-            println(stderr, "ERROR: Snail will not work correctly.")
+function start(port=10011; addr=ip"127.0.0.1")
+    global server, server_task, server_stop_flag
+
+    server_stop_flag[] = false
+    if server === nothing || !isopen(server)
+        server = listen(addr, port)
+    end
+
+    # Wait until we know its running
+    let wait_result = timedwait(() -> server.status == Base.StatusActive, 5.0)
+        if wait_result == :timed_out
+            @error "Timeout while waiting to open server socket for Snail."
+            return
         end
     end
    
@@ -1002,146 +997,134 @@ function start(port=10011; addr="127.0.0.1")
     # end
     CST.forcecompile()
 
-    # Proxy stdout/stderr
+    # Replace stdout and stderr with our proxy. This detects if we are currently
+    # in a request using CURRENT_REQUEST_STREAM, which is a scoped variable. If
+    # we are not in a request, it falls back to using the default stdout/stderr.
     if !isa(stdout, SnailProxyIO)
         Base.eval(Base, :(stdout = $SnailProxyIO($stdout)))
+    end   
+    if !isa(stderr, SnailProxyIO)
         Base.eval(Base, :(stderr = $SnailProxyIO($stderr)))
     end   
 
-    # main loop:
-    @async begin
-        while running
-            client = Sockets.accept(server_socket)
-            push!(client_sockets, client)
+    server_task = @async begin
+        while !server_stop_flag[]
+            client = accept(server)
+            # @info "Client connected: $client"
+            push!(clients, client)
             
-            @async while Sockets.isopen(client) && !eof(client)
-                # Parse input command
+            @async while isopen(client) && !eof(client)
                 command = readline(client, keep=true)
-                input = nothing
-                expr = nothing
-                current_reqid = nothing
-                try
-                    input = eval(Meta.parse(command))
-                    expr = Meta.parse(input.code)
-                    current_reqid = input.reqid
+                # @info command
+
+                # First try to parse the payload itself. If it fails, we don't
+                # have access to the reqid, so we just run emacs' "warn"
+                # function.
+                payload = try
+                    payload = eval(Meta.parse(command))
+                    if haskey(payload, :babel) && payload.babel !== nothing
+                        babel = eval(Meta.parse(payload.babel))
+                        merge(payload, (babel=babel,))
+                    else
+                        payload
+                    end
                 catch err
-                    # Probably a parsing error
+                    @error "Error parsing request payload" err
+                    resp = elexpr([:warn, "Julia snail: Error parsing request payload"])
+                    println(client, resp)
+                    continue
+                end
+
+                # Next try parsing the code as an Expr.
+                code = try
+                    Meta.parse(payload.code)
+                catch err
                     resp = elexpr([
                         Symbol("julia-snail--response-failure"),
-                        input.reqid,
+                        payload.reqid,
                         sprint(showerror, err),
                         tuple(string.(stacktrace(catch_backtrace()))...)
                     ])
-                    send_to_client(resp, client)
+                    println(client, resp)
                     continue
                 end
-                active_task = @task begin # process input
-                    request_stream = RequestStream(client, input.reqid, input.redirectio)
-               
-                    try
-                        result = eval_in_module(input.ns, expr, request_stream=request_stream)
-                        resp = elexpr([
-                            Symbol("julia-snail--response-success"),
-                            input.reqid,
-                            result
-                        ])
-                        send_to_client(resp, client)
-                    catch err
-                        if isa(err, InterruptException)
-                            resp = elexpr([
-                                Symbol("julia-snail--response-interrupt"),
-                                input.reqid
-                            ])
-                            send_to_client(resp, client)
-                        else
-                            try
-                                exc_stack = current_exceptions()
-                                err_str = sprint(exc_stack; context=:color => true) do io, stack
-                                    Base.invokelatest(Base.display_error, io, stack)
-                                end
-                        
-                                resp = elexpr([
-                                    Symbol("julia-snail--response-failure"),
-                                    input.reqid,
-                                    err_str,
-                                    tuple(string.(stacktrace(catch_backtrace()))...)
-                                ])
-                                send_to_client(resp, client)
-                            catch err2
-                                # internal Snail error or unexpected IO behavior..?
-                                println(stderr, "JuliaSnail: something broke in reqid: ", input.reqid, "; ", sprint(showerror, err2))
-                            end
-                        end
-                    finally
-                        lock(Tasks.active_tasks_lock) do
-                            delete!(Tasks.active_tasks, current_reqid)
-                        end
-                    end
-                end # process input
+                
+                # Process
+                req_task = @task process_request(client, payload, code)
                 
                 lock(Tasks.active_tasks_lock) do
-                    Tasks.active_tasks[current_reqid] = active_task
+                    Tasks.active_tasks[payload.reqid] = req_task
                 end
-                schedule(active_task)
-            end # async while loop for client connection
-        end
-        close(server_socket)
-    end
+                schedule(req_task)
+            end
+        end # server while loop
+        close(server)
+    end # server task
 end
 
 """
 Shut down the Snail server.
 """
 function stop()
-    global running = false
-    close(server_socket)
-    for _ in client_sockets
-        client = pop!(client_sockets)
-        close(client)
+    server_stop_flag[] = true
+
+    # Interrupt the blocking accept() call
+    server !== nothing && isopen(server) && close(server)
+    
+    # Clean up any active client connections
+    for _ in clients
+        client = pop!(clients)
+        isopen(client) && close(client)
     end
 end
 
 """
-Send data back to a client.
-
-For Emacs, this should be a string containing Elisp which Emacs will eval. It
-can be constructed from Julia data structures using elexpr.
-
-The client_socket parameter is optional. If specified, it will send data to that
-client. If omitted, then send_to_client will look at the client socket list. If
-that list only has one entry, it will send the data to that socket. If that list
-has multiple entries, send_to_client will prompt the user at the REPL to select
-which client should receive the message.
+Process the payload of a single request.
 """
-function send_to_client(expr, client_socket=nothing)
-    if isnothing(client_socket)
-        if isempty(client_sockets)
-            throw("No client connections available")
-        elseif 1 == length(client_sockets)
-            client_socket = first(client_sockets)
+function process_request(client::TCPSocket, payload::NamedTuple, code::Expr)
+    # @info "Payload" payload
+    reqid = payload.reqid
+    request_stream = RequestStream(
+        client=client,
+        reqid=reqid,
+        redirect=payload.redirectio,
+        babel=payload.babel
+    )
+               
+    try
+        result = eval_in_module(payload.ns, code, request_stream)
+        resp = elexpr([Symbol("julia-snail--response-success"), reqid, result])
+        println(client, resp)
+    catch err
+        if isa(err, InterruptException)
+            resp = elexpr([Symbol("julia-snail--response-interrupt"), reqid])
+            println(client, resp)
         else
-            # force the user to choose the client socket
-            options = map(
-                function(cs)
-                    gsn = Sockets.getpeername(cs)
-                    Printf.@sprintf("%s:%d", gsn[1], gsn[2])
-                end,
-                client_sockets
-            )
-            menu = REPL.TerminalMenus.RadioMenu(options)
-            choice = REPL.TerminalMenus.request("Send expression to which Snail client?", menu)
-            client_socket = client_sockets[choice]
-            # TODO: Ask if this should be the default socket from now on, and save
-            # in default_client_socket variable. Use default_client_variable
-            # automatically if it is set. Clean up default_client_variable on
-            # disconnect.
+            try
+                exc_stack = current_exceptions()
+                err_str = sprint(exc_stack; context=:color => true) do io, stack
+                    Base.invokelatest(Base.display_error, io, stack)
+                end
+                        
+                resp = elexpr([
+                    Symbol("julia-snail--response-failure"),
+                    reqid,
+                    err_str,
+                    tuple(string.(stacktrace(catch_backtrace()))...)
+                ])
+                println(client, resp)
+            catch err2
+                # Internal Snail error or unexpected IO behavior..?
+                @error "Something broke in reqid: $(reqid) " exception=err2
+            end
+        end
+    finally
+        lock(Tasks.active_tasks_lock) do
+            delete!(Tasks.active_tasks, reqid)
         end
     end
-    if !isopen(client_socket)
-        throw("Something broke: client socket is already closed")
-    end
-    println(client_socket, expr)
 end
 
+### Tail
 
 end
