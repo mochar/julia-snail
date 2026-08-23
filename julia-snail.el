@@ -1790,8 +1790,11 @@ evaluated in the context of MODULE."
 
 (defvar-keymap julia-snail-srcbuf-overlay-keymap
   :doc "Keymap for source buffer overlays."
-  "S-RET" 'julia-snail-srcbuf-ov-toggle
-  "S-<return>" 'julia-snail-srcbuf-ov-toggle)
+  "S-RET" 'julia-snail-srcbuf-ov-toggle-folding
+  "S-<return>" 'julia-snail-srcbuf-ov-toggle-folding
+  "M-RET" 'julia-snail-srcbuf-ov-toggle-type
+  "M-<return>" 'julia-snail-srcbuf-ov-toggle-type
+  )
 
 (defun julia-snail-srcbuf-ov--delete (ov &rest _)
   (delete-overlay ov))
@@ -1840,12 +1843,16 @@ evaluated in the context of MODULE."
     (replace-regexp-in-string "\n+$" "")
     (replace-regexp-in-string "^\n+" "")))
 
-(defun julia-snail-srcbuf-ov--req-data-string (req-data)
+(defun julia-snail-srcbuf-ov--req-data-string (req-data &optional type)
   (let* ((buf (julia-snail--request-data-stream-buf req-data))
          (res (julia-snail--request-data-result req-data)))
-    (when-let ((text (cond
-                      (res (format "%s" res))
-                      (buf (with-current-buffer buf (buffer-string))))))
+    (when-let* ((type (cond
+                       (type type)
+                       (res 'result)
+                       (buf 'stream)))
+                (text (if (eq type 'result)
+                          (format "%s" res)
+                        (with-current-buffer buf (buffer-string)))))
       (julia-snail-srcbuf-ov--clean-string text))))
 
 (defun julia-snail-srcbuf-ov--make (beg end req-data)
@@ -1861,14 +1868,14 @@ evaluated in the context of MODULE."
           (progn
             (overlay-put ov 'after-string (julia-snail-srcbuf-ov--propertize text))
             (overlay-put ov 'julia-snail-eval
-                         (list (if folded 'folded 'expanded) req-data)))
-        (overlay-put ov 'julia-snail-eval (list 'folded req-data))))))
+                         (list (if folded 'folded 'expanded) nil req-data)))
+        (overlay-put ov 'julia-snail-eval (list 'folded nil req-data))))))
 
 (defun julia-snail-srcbuf-ov--update (ov)
   (when-let* ((buf (overlay-buffer ov)) ; nil if buf dead
               (eval-props (overlay-get ov 'julia-snail-eval)))
-    (cl-destructuring-bind (fold req-data) eval-props
-      (when-let ((text (julia-snail-srcbuf-ov--req-data-string req-data)))
+    (cl-destructuring-bind (fold type req-data) eval-props
+      (when-let ((text (julia-snail-srcbuf-ov--req-data-string req-data type)))
         (pcase fold
           ('folded
            (julia-snail-srcbuf-ov--fold-string text)
@@ -1885,8 +1892,8 @@ evaluated in the context of MODULE."
 
 (defun julia-snail-srcbuf-ov--expand (ov)
   (when-let* ((eval-props (overlay-get ov 'julia-snail-eval)))
-    (cl-destructuring-bind (fold req-data) eval-props
-      (when-let ((text (julia-snail-srcbuf-ov--req-data-string req-data)))
+    (cl-destructuring-bind (fold type req-data) eval-props
+      (when-let ((text (julia-snail-srcbuf-ov--req-data-string req-data type)))
         (when (eq fold 'folded)
           (setf (car (overlay-get ov 'julia-snail-eval)) 'expanded)
           (when (julia-snail-srcbuf-ov--fold-boundary text)
@@ -1899,8 +1906,8 @@ evaluated in the context of MODULE."
 
 (defun julia-snail-srcbuf-ov--fold (ov)
   (when-let* ((eval-props (overlay-get ov 'julia-snail-eval)))
-    (cl-destructuring-bind (fold req-data) eval-props
-      (when-let ((text (julia-snail-srcbuf-ov--req-data-string req-data)))
+    (cl-destructuring-bind (fold type req-data) eval-props
+      (when-let ((text (julia-snail-srcbuf-ov--req-data-string req-data type)))
         (when (eq fold 'expanded)
           (setf (car (overlay-get ov 'julia-snail-eval)) 'folded)
           (julia-snail-srcbuf-ov--fold-string text)
@@ -1917,15 +1924,32 @@ evaluated in the context of MODULE."
         (setq nearest ov)))
     nearest))
 
-(defun julia-snail-srcbuf-ov-toggle ()
+(defun julia-snail-srcbuf-ov-toggle-folding ()
   "Expand or contract the display of evaluation results around `point'."
   (interactive)
   (when-let* ((ov (julia-snail-srcbuf-ov--nearest))
               (props (overlay-get ov 'julia-snail-eval)))
-    (cl-destructuring-bind (fold _) props
+    (julia-snail--flash-region (overlay-start ov) (overlay-end ov))
+    (cl-destructuring-bind (fold _ _) props
       (if (eq fold 'folded)
           (julia-snail-srcbuf-ov--expand ov)
         (julia-snail-srcbuf-ov--fold ov)))))
+
+(defun julia-snail-srcbuf-ov-toggle-type ()
+  "Toggle between stream and result."
+  (interactive)
+  (when-let* ((ov (julia-snail-srcbuf-ov--nearest))
+              (props (overlay-get ov 'julia-snail-eval)))
+    (julia-snail--flash-region (overlay-start ov) (overlay-end ov))
+    (cl-destructuring-bind (_ type _) props
+      (setf (nth 1 (overlay-get ov 'julia-snail-eval))
+            (if (or (null type) (eq type 'stream))
+                (progn
+                  (message "Showing result")
+                  'result)
+              (message "Showing stream")
+              'stream))
+      (julia-snail-srcbuf-ov--update ov))))
 
 (defun julia-snail-srcbuf-ov-remove-all ()
   "Remove all evaluation result overlays in the buffer."
