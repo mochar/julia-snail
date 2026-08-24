@@ -422,18 +422,21 @@ nothing and return nil."
       (when (search-forward (concat "julia-async:" reqid) nil t)
         (delete-region (line-beginning-position) (1+ (line-end-position)))))))
 
-(defun julia-snail-ob--goto-result ()
+(defun julia-snail-ob--goto-result (&optional end-p)
   (goto-char (org-babel-where-is-src-block-result 'insert))
   (forward-line 1) ; Skip past the #+RESULTS line
+  (when end-p
+    (goto-char (org-babel-result-end)))
   (unless (bolp) (insert "\n")))
 
 (defun julia-snail-ob--format-result (text)
   (let ((text (format "%s" text)))
     ;; From `org-element-fixed-width-interpreter'
     (concat
-     (if (string-empty-p text) ":"
+     (if (string-empty-p text) ":\n"
        (replace-regexp-in-string "^" ": " text))
-     "\n")))
+     ;; "\n"
+     )))
 
 (defun julia-snail-ob--place-result (request &optional result)
   "Place RESULT of julia snail REQUEST.
@@ -445,7 +448,7 @@ If RESULT is nil, place result stored in REQUEST's data slot."
            (params (plist-get properties :params))
            (output-file (plist-get properties :output-file)))
       (julia-snail-ob-with-point-at request
-        (julia-snail-ob--goto-result)
+        (julia-snail-ob--goto-result 'end)
         (insert (julia-snail-ob--format-result result))
         (run-hooks 'julia-snail-ob-after-async-execute-hook)))))
 
@@ -459,26 +462,42 @@ If RESULT is nil, place result stored in REQUEST's data slot."
       (julia-snail-ob--goto-result)
       (if-let* ((result-end (org-babel-result-end))
                 (stream-ov (car (ov-in 'julia-snail-stream t (point) result-end))))
-          (replace-region-contents
-           (ov-beg stream-ov) (ov-end stream-ov)
-           (julia-snail-ob--format-result stream-str)
-           nil nil 'inherit)
+          (progn
+            ;; Replace region with space char, since deleting everything will
+            ;; delete the overlay. We could have also replaced it directly with
+            ;; the stream buffer content but this leads to weird rendering
+            ;; problems with escape codes.
+            (replace-region-contents
+             (ov-beg stream-ov) (ov-end stream-ov)
+             " ")
+            (goto-char (ov-beg stream-ov))
+            (insert (julia-snail-ob--format-result stream-str)))
         (let* ((beg (point))
                (end (progn
                       (insert (julia-snail-ob--format-result stream-str))
                       (point)))
                (ov (make-overlay beg end)))
+          (overlay-put ov 'evaporate t)
           ;; (overlay-put ov 'face 'dired-marked)
           (overlay-put ov 'julia-snail-stream t))))))
 
+;; From `jupyter-org-element-begin-after-affiliated'
+(defun julia-snail-ob--element-begin-after-affiliated (element)
+  "Return the beginning position of ELEMENT after any affiliated keywords."
+  (or (org-element-property :post-affiliated element)
+      (org-element-property :begin element)))
+
 ;; From `jupyter-org-request-at-point'
 (defun julia-snail-ob-request-at-point ()
+  (interactive)
   (when-let* ((context (org-element-context))
               (babel-p (memq (org-element-type context)
                              '(src-block babel-call
                                          inline-babel-call inline-src-block)))
-              (pos (jupyter-org-element-begin-after-affiliated context))
+              (pos (julia-snail-ob--element-begin-after-affiliated context))
               (req (get-text-property pos 'julia-snail-request)))
+    (when (called-interactively-p 'interactive)
+      (pp-eval-expression req))
     req))
 
 ;;;; Backend functions
@@ -580,14 +599,13 @@ Unless an output file is explicitly specified with the header arg
            :babel-props (list :params params :output-file output-file)
            :marker (copy-marker org-babel-current-src-block-location)
            :callback-success #'julia-snail-ob-success-callback
-           :callback-failure #'julia-snail-ob-failure-callback
            :callback-stream  #'julia-snail-ob-stream-callback
+           :callback-failure #'julia-snail-ob-failure-callback
            )))
     (put-text-property
      org-babel-current-src-block-location
      (1+ org-babel-current-src-block-location)
      'julia-snail-request req)
-    ;; TODO Add overlay to src block to prevent editing
     (concat "julia-async:" (julia-snail-request-id req))))
 
 (defun julia-snail-ob-success-callback (request result)
@@ -666,6 +684,7 @@ PARAMS are the parameter passed to the block"
     ;; Ensure module exists
     (julia-snail-ob--ensure-module session params)
 
+    ;; TODO Add overlay to src block to prevent editing
     (if (julia-snail-ob-async-p params)
         ;; Async execution
         (julia-snail-ob-evaluate-in-session:async

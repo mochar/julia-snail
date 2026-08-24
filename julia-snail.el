@@ -1319,6 +1319,10 @@ evaluated in the context of MODULE."
 
 ;; TODO When we implement passing source (stdout/stderr), encode stderr text with red face
 (defun julia-snail--stream (reqid type chunk)
+  "Store the stream CHUNK of request with id REQID in its data slot.
+
+This handles escape sequences, though ansi coloring is not applied, as
+this uses overlays which cannot be copied over with (buffer-string)."
   (when-let* ((req (gethash reqid julia-snail--requests))
               (data (julia-snail-request-data req))
               (buf (julia-snail--request-data-stream-buf data)))
@@ -1348,9 +1352,6 @@ evaluated in the context of MODULE."
         (while (re-search-forward "\033\\[K" nil t)
           (replace-match "")
           (delete-region (point) (line-end-position)))
-        
-        ;; Render ANSI Colors
-        (ansi-color-apply-on-region start (point-max))
         
         (goto-char (point-max))))
     (when-let* ((callback (julia-snail-request-callback-stream req)))
@@ -1699,15 +1700,24 @@ evaluated in the context of MODULE."
 
 (defun julia-snail-srcbuf-ov--propertize (text &optional newline)
   ;; Display properties can't be nested so use the one on TEXT if available
-  (if (get-text-property 0 'display text) text
+  (if (get-text-property 0 'display text)
+      text
     (let ((display (concat
                     ;; Add a space before a newline so that `point' stays on
                     ;; the same line when moving to the beginning of the
                     ;; overlay.
                     (if newline " \n" " ")
                     (propertize
-                     (concat julia-snail-srcbuf-overlay-prefix text)
-                     'face 'julia-snail-srcbuf-overlay))))
+                     julia-snail-srcbuf-overlay-prefix
+                     'face 'julia-snail-srcbuf-overlay)
+                    ;; TODO This removes ansi applied colors, not sure how to fix it.
+                    ;; add-face-text-property doesnt work.
+                    ;; text
+                    (propertize
+                     text
+                     'face 'julia-snail-srcbuf-overlay)
+                    )))
+      ;; (add-face-text-property 0 (length display) 'underline t display)
       ;; Ensure `point' doesn't move past the beginning or end of the overlay
       ;; on motion commands.
       (put-text-property 0 1 'cursor t display)
@@ -1745,8 +1755,10 @@ evaluated in the context of MODULE."
                        (buf 'stream)))
                 (text (if (eq type 'result)
                           (format "%s" res)
-                        (with-current-buffer buf (buffer-string)))))
-      (julia-snail-srcbuf-ov--clean-string text))))
+                        (with-current-buffer buf (buffer-string))))
+                (text (julia-snail-srcbuf-ov--clean-string text))
+                (text (ansi-color-apply text)))
+      text)))
 
 (defun julia-snail-srcbuf-ov--make (beg end req-data)
   (let ((ov (make-overlay beg end nil t)))
