@@ -1,7 +1,7 @@
 ;;; julia-snail.el --- Julia Snail -*- lexical-binding: t -*-
 
 ;; URL: https://github.com/gcv/julia-snail
-;; Package-Requires: ((emacs "26.2") (dash "2.16.0") (julia-mode "0.3") (s "1.12.0") (spinner "1.7.3") (popup "0.5.9"))
+;; Package-Requires: ((emacs "26.2") (dash "2.16.0") (julia-mode "0.3") (s "1.12.0") (spinner "1.7.3"))
 ;; Version: 1.3.3
 ;; Created: 2019-10-27
 
@@ -35,7 +35,6 @@
 (require 'dash)
 (require 'easymenu)
 (require 'json)
-(require 'popup)
 (require 'pulse)
 (require 'rx)
 (require 's)
@@ -207,26 +206,12 @@ another."
   :safe 'booleanp
   :type 'boolean)
 
-(defcustom julia-snail-popup-display-eval-results :command
-  "Control display of code evaluation results in source buffers."
-  :tag "Control display of code evaluation results in source buffers"
-  :group 'julia-snail
-  :safe (lambda (v) (memq v '(:command :change nil)))
-  :type '(choice (const :tag "Until next command" :command)
-                 (const :tag "Until next buffer change" :change)
-                 (const :tag "Off" nil)))
-
 (defcustom julia-snail-copy-eval-results-to-kill-ring nil
   "If true, copy inline evaluation results to the kill ring automatically."
   :tag "Copy inline evaluation results to kill ring automatically"
   :group 'julia-snail
   :safe 'booleanp
   :type 'boolean)
-
-(defcustom julia-snail-popup-display-face nil
-  "Face used to display popups. If nil, try to make popups look reasonable."
-  :group 'julia-snail
-  :type 'face)
 
 (defcustom julia-snail-srcbuf-overlays t
   "Display evaluation results as overlays in the source buffers.
@@ -370,8 +355,6 @@ nil means disable Snail-specific imenu integration (fall back on julia-mode impl
 (defvar julia-snail--imenu-fallback-index-function nil)
 
 (defvar-local julia-snail--repl-go-back-target nil)
-
-(defvar-local julia-snail--popups (list))
 
 (defvar-local julia-snail--last-eval-result nil)
 
@@ -1185,7 +1168,6 @@ nil, wait for the result and return it."
      line-num
      &key
      (repl-buf (get-buffer julia-snail-repl-buffer))
-     (popup-display-params nil)
      callback-success
      callback-failure)
   "Send STR to server by first writing it to a tmpfile, calling
@@ -1206,16 +1188,11 @@ evaluated in the context of MODULE."
         (insert text))
       (let ((req (julia-snail--send-to-server
                      :Main
-                     (format "Main.JuliaSnail.eval_tmpfile(\"%s\", %s, \"%s\", %s%s)"
+                     (format "Main.JuliaSnail.eval_tmpfile(\"%s\", %s, \"%s\", %s)"
                              (or tmpfile-local-remote tmpfile)
                              module-ns
                              filename
-                             line-num
-                             (if (and julia-snail-popup-display-eval-results popup-display-params)
-                                 (format ", Main.JuliaSnail.PopupDisplay.Params(%d, %d)"
-                                         (car popup-display-params)
-                                         (cadr popup-display-params))
-                               ""))
+                             line-num)
                      :repl-buf repl-buf
                      ;; TODO: Only async via-tmp-file evaluation is currently
                      ;; supported because we rely on getting the reqid back from
@@ -1689,103 +1666,6 @@ evaluated in the context of MODULE."
     ;; return the result
     imenu-index))
 
-
-;;;; Popup display support
-
-(defun julia-snail--popup-params (pt)
-  (when julia-snail-popup-display-eval-results
-    (let* ((col-row (or (posn-actual-col-row (posn-at-point pt))
-                        '(0 . 0)))
-           (col (car col-row))
-           (row (cdr col-row))
-           (width (- (window-width) col 3))
-           (height (pcase julia-snail-popup-display-eval-results
-                     (:command (- (window-height) row 1))
-                     (:change 1))))
-      (list width height))))
-
-(defun julia-snail--popup-extract-string (data)
-  (when julia-snail-popup-display-eval-results
-    (let* ((read-data (read data))
-           ;; scary
-           (eval-data (eval read-data)))
-      (when (and (listp eval-data) (car eval-data))
-        (cadr eval-data)))))
-
-(defun julia-snail--record-eval-result (str)
-  "Store STR as the latest inline evaluation result for the current buffer."
-  (when (and (stringp str)
-             (> (length (s-trim str)) 0))
-    (setq julia-snail--last-eval-result str)
-    (when julia-snail-copy-eval-results-to-kill-ring
-      (kill-new str))))
-
-(defvar julia-snail--popup-cleanup-skip-kludge nil)
-
-(cl-defun julia-snail--popup-display (pt str &key (use-cleanup-kludge nil))
-  (when julia-snail-popup-display-eval-results
-    ;; remove existing popup(s) in this location
-    (cl-loop for popup in julia-snail--popups do
-             (when (= pt (popup-point popup))
-               (popup-delete popup)))
-    ;; empty string: display nothing
-    (when (string= "" (s-trim str))
-      (cl-return-from julia-snail--popup-display))
-    (let* ((lines-split (s-split (rx "\n") str))
-           (lines (cl-loop for line in lines-split collect
-                           (concat (propertize " " 'face `(:background 'inherit))
-                                   line " \n")))
-           (display-str (s-trim-right (apply #'concat lines)))
-           (popup (let ((popup-tip-max-width (window-width)))
-                    ;; XXX: Dirty workaround for #110. popup-tip calls
-                    ;; popup-replace-displayable which is SLOW (as of
-                    ;; 2022-09-26). So just bypass it until popup.el releases a
-                    ;; fixed version, and then adjust the Snail dependency
-                    ;; version.
-                    (declare-function popup-replace-displayable "popup.el")
-                    (cl-letf (((symbol-function 'popup-replace-displayable)
-                               (lambda (str &optional _rep) str)))
-                      (popup-tip display-str
-                                 :point pt
-                                 :around nil
-                                 :face (if julia-snail-popup-display-face
-                                           julia-snail-popup-display-face
-                                         `(:background
-                                           ,(julia-snail--color-shift-hex (face-attribute 'default :background) (face-attribute 'default :foreground) :by 63)
-                                           :foreground ,(face-attribute 'default :foreground)))
-                                 :nowait t
-                                 :nostrip t)))))
-      (add-to-list 'julia-snail--popups popup)
-      (when use-cleanup-kludge
-        (setq julia-snail--popup-cleanup-skip-kludge t))
-      (julia-snail--popup-add-cleanup-hooks))))
-
-(cl-defun julia-snail--popup-cleanup (&rest _)
-  ;; XXX: Prevent this cleanup from happening too early when the
-  ;; post-command-hook is installed by the command which added the popup in the
-  ;; first place.
-  (when julia-snail--popup-cleanup-skip-kludge
-    (setq julia-snail--popup-cleanup-skip-kludge nil)
-    (cl-return-from julia-snail--popup-cleanup))
-  ;; cleanup:
-  (cl-loop for popup in julia-snail--popups do
-           (popup-delete popup))
-  (setq julia-snail--popups (list))
-  (let ((hook (pcase julia-snail-popup-display-eval-results
-                (:command 'post-command-hook)
-                (:change 'after-change-functions)
-                (_ (user-error "Invalid value of julia-snail-popup-display-eval-results: %s" julia-snail-popup-display-eval-results)))))
-    (remove-hook hook #'julia-snail--popup-cleanup 'local)))
-
-(defun julia-snail--popup-add-cleanup-hooks ()
-  (when julia-snail-popup-display-eval-results
-    (let ((hook (pcase julia-snail-popup-display-eval-results
-                  (:command 'post-command-hook)
-                  (:change 'after-change-functions)
-                  (_ (user-error "Invalid value of julia-snail-popup-display-eval-results: %s" julia-snail-popup-display-eval-results)))))
-      (add-hook hook #'julia-snail--popup-cleanup nil 'local))))
-
-
 ;;;; Overlays in source buffers
 
 ;; Show evaluation streams and results as overlays in source buffers.
@@ -2182,10 +2062,7 @@ enabled for this to work, and something like this is required for
 activation:
 (add-to-list 'code-cells-eval-region-commands '(julia-snail-mode . julia-snail-send-code-cell))"
   (julia-snail--send-helper
-   block-start block-end
-   :allow-send-to-repl nil
-   :popup-block-end (- block-end 1)
-   :message-prefix "Code cell evaluated"))
+   block-start block-end))
 
 (defun julia-snail-send-top-level-form ()
   "Send the top level form around the point to the Julia REPL and evaluate it.
@@ -2210,11 +2087,7 @@ Currently only works on blocks terminated with `end'."
         text
         filename
         line-num
-        :popup-display-params (julia-snail--popup-params block-end)
         :callback-success (lambda (_request-info &optional data)
-                            (let ((str (julia-snail--popup-extract-string data)))
-                              (julia-snail--record-eval-result str)
-                              (julia-snail--popup-display block-end str))
                             (message "Top-level form evaluated: %s; module %s"
                                      (if top-level-form-name
                                          top-level-form-name
@@ -2498,7 +2371,6 @@ The following keys are set:
         (setq imenu-create-index-function 'julia-snail-imenu)
         (if (and (or (locate-library "company-quickhelp")
                      (locate-library "corfu-doc") ; deprecated; keeping around for backwards compatibility
-                     ;; TODO / FIXME: Implement a clean check for corfu-popupinfo, the Corfu documentation display system
                      )
                  julia-snail-completions-doc-enable)
             (add-hook 'completion-at-point-functions #'julia-snail-completions-doc-capf nil t)

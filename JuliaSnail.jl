@@ -133,31 +133,6 @@ function elexpr(arg::ElispKeyword)
 end
 
 
-### Emacs popup display
-
-module PopupDisplay
-
-struct Params
-    width::Int64
-    height::Int64
-end
-
-function format(obj, width, height)
-    if isnothing(obj)
-        return ""
-    end
-    io = IOBuffer()
-    show(IOContext(io,
-        :compact => true,
-        :displaysize => (height, width),
-        :limit => true),
-        "text/plain",
-        obj)
-    String(take!(io))
-end
-
-end
-
 ### Request stream
 
 # Individual requests should have their own independent stdout/stderr streams so
@@ -363,8 +338,7 @@ modpath array and modify the parsed expression to refer to realfile (instead of
 tmpfile) line numbers. Used to evaluate a top-level form in a file while
 preserving the original filename and line numbers for xref and stack traces.
 """
-function eval_tmpfile(tmpfile, modpath, realfile, linenum,
-    popup_params::Union{Nothing, PopupDisplay.Params}=nothing)
+function eval_tmpfile(tmpfile, modpath, realfile, linenum)
     realfilesym = Symbol(realfile)
     code = read(tmpfile, String)
     exprs = Meta.parse(code)
@@ -387,14 +361,7 @@ function eval_tmpfile(tmpfile, modpath, realfile, linenum,
         end
     end
    
-    if isnothing(popup_params)
-        Main.JuliaSnail.elexpr(true, result)
-    else
-        Main.JuliaSnail.elexpr((
-            true,
-            Main.JuliaSnail.PopupDisplay.format(result, popup_params.width, popup_params.height)
-        ))
-    end
+    Main.JuliaSnail.elexpr(true, result)
 end
 
 
