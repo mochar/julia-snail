@@ -124,9 +124,8 @@ elexpr(arg::Bool) = arg ? "t" : "nil"
 elexpr(arg::Nothing) = "nil"
 
 function elexpr(arg::Any)
-    @warn "Type $(typeof(arg)) cannot be converted to elexpr, set to nil" arg
-    # display(stacktrace())
-    "nil"
+    # We need this in case type of "arg" is loaded after julia snail
+    elexpr(Base.invokelatest(repr, "text/plain", arg))
 end
 
 function elexpr(arg::ElispKeyword)
