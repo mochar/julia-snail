@@ -320,13 +320,14 @@ nil means disable Snail-specific imenu integration (fall back on julia-mode impl
   result
   finalizer)
 
-(cl-defstruct julia-snail--request-tracker
+(cl-defstruct julia-snail-request
   "Snail protocol request tracking data structure."
   id
   repl-buf
-  origin-buf
+  marker
   (callback-success (lambda (&optional _data) (message "Snail command succeeded")))
   (callback-failure (lambda () (message "Snail command failed")))
+  callback-stream
   (display-error-buffer-on-failure? t)
   babel-props
   data
@@ -1062,16 +1063,17 @@ wait for the REPL prompt to return, otherwise return immediately."
      str
      &key
      (repl-buf (get-buffer julia-snail-repl-buffer))
+     (marker (point-marker))
      (async t)
      (async-poll-interval 20)
      (async-poll-maximum julia-snail-async-timeout)
      (display-error-buffer-on-failure? t)
      babel-props
-     (redirect-io :unspecified)
-     (origin-buf (current-buffer))
+     (redirect-io t)
      srcbuf-ov
      callback-success
-     callback-failure)
+     callback-failure
+     callback-stream)
   "Send STR to Snail server, and evaluate it in the context of MODULE.
 Run callback-success and callback-failure as appropriate.
 When :async is t (default), return the request id. When :async is
@@ -1093,9 +1095,6 @@ nil, wait for the result and return it."
                                   (plist-get babel-props :params))
                                  (plist-get babel-props :output-file)))
                       "nothing"))
-         (redirect-io (if (eq redirect-io :unspecified)
-                          (null babel-props)
-                        (if redirect-io t nil)))
          (redirect-io-str (if redirect-io "true" "false"))
          (msg (format "(ns = %s, reqid = \"%s\", code = %s, babel = %s, redirectio = %s)\n"
                       module-ns
@@ -1111,52 +1110,51 @@ nil, wait for the result and return it."
                               babel-str
                               redirect-io-str))
          (res-sentinel (gensym))
-         (res res-sentinel))
+         (res res-sentinel)
+         (req (let* ((stream-buf (generate-new-buffer
+                                  (format " *julia-snail-stream-%s*" reqid)))
+                     (data (make-julia-snail--request-data
+                            :stream-buf stream-buf
+                            :finalizer (make-finalizer
+                                        (lambda ()
+                                          (when (buffer-live-p stream-buf)
+                                            (kill-buffer stream-buf))))))
+                     (srcbuf-ov (when (and srcbuf-ov (marker-buffer marker))
+                                  (with-current-buffer (marker-buffer marker)
+                                    (julia-snail-srcbuf-ov-display
+                                     (car srcbuf-ov)
+                                     (cdr srcbuf-ov)
+                                     data)))))
+                (make-julia-snail-request
+                 :id reqid
+                 :repl-buf repl-buf
+                 :marker marker
+                 :babel-props babel-props
+                 :srcbuf-ov srcbuf-ov
+                 :data data
+                 :display-error-buffer-on-failure? display-error-buffer-on-failure?
+                 :callback-stream callback-stream
+                 :callback-success (lambda (req &optional data)
+                                     (unless async
+                                       (setq res (or data :nothing)))
+                                     (when (and callback-success (marker-buffer marker))
+                                       (with-current-buffer (marker-buffer marker)
+                                         (funcall callback-success req data))))
+                 :callback-failure (lambda (req)
+                                     (unless async
+                                       (setq res :nothing))
+                                     (when (and callback-failure (marker-buffer marker))
+                                       (with-current-buffer (marker-buffer marker)
+                                         (funcall callback-failure req))))))))
     (with-current-buffer process-buf
       (goto-char (point-max))
       (insert display-msg))
     (process-send-string process-buf msg)
     (spinner-start 'progress-bar)
-    (puthash
-     reqid
-     (let* ((stream-buf (generate-new-buffer
-                         (format " *julia-snail-stream-%s*" reqid)))
-            (data (make-julia-snail--request-data
-                   :stream-buf stream-buf
-                   :finalizer (make-finalizer
-                               (lambda ()
-                                 (when (buffer-live-p stream-buf)
-                                   (kill-buffer stream-buf))))))
-            (srcbuf-ov (when srcbuf-ov
-                         (with-current-buffer origin-buf
-                           (julia-snail-srcbuf-ov-display
-                            (car srcbuf-ov)
-                            (cdr srcbuf-ov)
-                            data)))))
-       (make-julia-snail--request-tracker
-        :id reqid
-        :repl-buf repl-buf
-        :origin-buf origin-buf
-        :babel-props babel-props
-        :srcbuf-ov srcbuf-ov
-        :data data
-        :display-error-buffer-on-failure? display-error-buffer-on-failure?
-        :callback-success (lambda (request-info &optional data)
-                            (unless async
-                              (setq res (or data :nothing)))
-                            (when callback-success
-                              (with-current-buffer origin-buf
-                                (funcall callback-success request-info data))))
-        :callback-failure (lambda (request-info)
-                            (unless async
-                              (setq res :nothing))
-                            (when callback-failure
-                              (with-current-buffer origin-buf
-                                (funcall callback-failure request-info))))))
-     julia-snail--requests)
+    (puthash reqid req julia-snail--requests)
 
     (if async
-        reqid
+        req
       ;; XXX: Non-async (i.e. synchronous) server requests need to poll the
       ;; response. This means they can either (1) succeed, (2) timeout, or (3)
       ;; error out. Because errors occur in the process filter function and
@@ -1176,7 +1174,7 @@ nil, wait for the result and return it."
                              (format "Snail error: %s" wait-result))))
             (when callback-failure
               (funcall callback-failure))
-            (with-current-buffer origin-buf
+            (with-current-buffer (marker-buffer marker)
               (spinner-stop))
             (error error-msg)))))))
 
@@ -1206,7 +1204,7 @@ evaluated in the context of MODULE."
     (progn
       (with-temp-file tmpfile
         (insert text))
-      (let ((reqid (julia-snail--send-to-server
+      (let ((req (julia-snail--send-to-server
                      :Main
                      (format "Main.JuliaSnail.eval_tmpfile(\"%s\", %s, \"%s\", %s%s)"
                              (or tmpfile-local-remote tmpfile)
@@ -1227,12 +1225,10 @@ evaluated in the context of MODULE."
                      :async t
                      :callback-success callback-success
                      :callback-failure callback-failure)))
-        ;; update the request info to include tmpfile tracking
-        (let ((reqtr (gethash reqid julia-snail--requests)))
-          (setf (julia-snail--request-tracker-tmpfile reqtr) tmpfile)
-          (setf (julia-snail--request-tracker-tmpfile-local-remote reqtr) tmpfile-local-remote))
-        ;; and return the reqid
-        reqid))))
+        ;; Update the request info to include tmpfile tracking
+        (setf (julia-snail-request-tmpfile reqtr) tmpfile)
+        (setf (julia-snail-request-tmpfile-local-remote reqtr) tmpfile-local-remote)
+        req))))
 
 (defun julia-snail--server-response-filter (proc str)
   "Snail process filter for PROC given input STR; used as argument to `set-process-filter'."
@@ -1247,7 +1243,7 @@ evaluated in the context of MODULE."
       ;; input, but a failed read needs to be concatenated to other upcoming
       ;; reads. Track them in a table hashed by the proc.
       (let ((candidate (s-concat (gethash proc julia-snail--proc-responses) str)))
-        (condition-case err
+        (condition-case-unless-debug err
             (let ((read-str (read candidate)))
               ;; read succeeds, so clean up and return its eval value
               (remhash proc julia-snail--proc-responses)
@@ -1268,26 +1264,26 @@ evaluated in the context of MODULE."
 
 (defun julia-snail--response-base (reqid)
   "Snail response handler for REQID, base function."
-  (let ((request (gethash reqid julia-snail--requests)))
-    (when request
-      ;; Delete tmpfile
-      (when-let (tmpfile (julia-snail--request-tracker-tmpfile request))
-        (delete-file tmpfile))
-      ;; Stop spinner
-      (with-current-buffer (julia-snail--request-tracker-origin-buf request)
-        (spinner-stop))
-      ;; Remove request ID from requests hash
-      (remhash reqid julia-snail--requests))))
+  (when-let* ((request (gethash reqid julia-snail--requests)))
+    ;; Delete tmpfile
+    (when-let* ((tmpfile (julia-snail-request-tmpfile request)))
+      (delete-file tmpfile))
+    ;; Stop spinner
+    (with-current-buffer (marker-buffer (julia-snail-request-marker request))
+      (spinner-stop))
+    ;; Remove request ID from requests hash
+    (remhash reqid julia-snail--requests)))
 
 (defun julia-snail--response-success (reqid result)
   "Snail success response handler for REQID given RESULT."
   (let* ((request (gethash reqid julia-snail--requests)))
-    (when-let ((callback-success (julia-snail--request-tracker-callback-success request)))
-      (funcall callback-success request result))
-    (when-let ((data (julia-snail--request-tracker-data request)))
+    (when-let* ((data (julia-snail-request-data request)))
       (setf (julia-snail--request-data-result data) result)
-      (when-let ((ov (julia-snail--request-tracker-srcbuf-ov request)))
-        (julia-snail-srcbuf-ov--update ov))))
+      ;; TODO Replace with callback
+      (when-let* ((ov (julia-snail-request-srcbuf-ov request)))
+        (julia-snail-srcbuf-ov--update ov)))
+    (when-let* ((callback-success (julia-snail-request-callback-success request)))
+      (funcall callback-success request result)))
   (julia-snail--response-base reqid))
 
 (defun julia-snail--response-failure (reqid error-message error-stack)
@@ -1295,7 +1291,7 @@ evaluated in the context of MODULE."
   (if (not julia-snail-show-error-window)
       (message error-message)
     (let* ((request-info (gethash reqid julia-snail--requests))
-           (repl-buf (julia-snail--request-tracker-repl-buf request-info))
+           (repl-buf (julia-snail-request-repl-buf request-info))
            (process-buf (get-buffer (julia-snail--process-buffer-name repl-buf)))
            (error-buffer (julia-snail--message-buffer
                           repl-buf
@@ -1303,8 +1299,8 @@ evaluated in the context of MODULE."
                           ;; (format "%s\n\n%s" error-message (s-join "\n" error-stack))
                           error-message
                           ))
-           (callback-failure (julia-snail--request-tracker-callback-failure request-info)))
-      (when (julia-snail--request-tracker-display-error-buffer-on-failure? request-info)
+           (callback-failure (julia-snail-request-callback-failure request-info)))
+      (when (julia-snail-request-display-error-buffer-on-failure? request-info)
         (julia-snail--setup-compilation-mode error-buffer (gethash process-buf julia-snail--cache-proc-basedir))
         (pop-to-buffer error-buffer))
       (when callback-failure
@@ -1347,7 +1343,7 @@ evaluated in the context of MODULE."
 ;; TODO When we implement passing source (stdout/stderr), encode stderr text with red face
 (defun julia-snail--stream (reqid type chunk)
   (when-let* ((req (gethash reqid julia-snail--requests))
-              (data (julia-snail--request-tracker-data req))
+              (data (julia-snail-request-data req))
               (buf (julia-snail--request-data-stream-buf data)))
     (with-current-buffer buf
       (let ((inhibit-read-only t)
@@ -1380,7 +1376,10 @@ evaluated in the context of MODULE."
         (ansi-color-apply-on-region start (point-max))
         
         (goto-char (point-max))))
-    (when-let ((ov (julia-snail--request-tracker-srcbuf-ov req)))
+    (when-let* ((callback (julia-snail-request-callback-stream req)))
+      (funcall callback req type))
+    ;; TODO Move this to stream callback
+    (when-let* ((ov (julia-snail-request-srcbuf-ov req)))
       (julia-snail-srcbuf-ov--update ov))))
 
 

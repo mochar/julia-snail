@@ -13,6 +13,7 @@
 ;;;; Requires
 
 (require 'ob)
+(require 'ov)
 (require 'subr-x)
 (require 'cl)
 (require 'cl-generic)
@@ -42,6 +43,11 @@ the environment name, i.e. \\begin{environment*}."
 LaTeX environment used in the result to `equation'. See also
 `julia-snail-ob-latexify-star-environments'."
   :type 'boolean
+  :group 'julia-snail-ob)
+
+(defcustom julia-snail-ob-resource-directory "./.ob-snail/"
+  "Directory used to store automatically generated image files."
+  :type 'string
   :group 'julia-snail-ob)
 
 (defconst org-babel-header-args:julia
@@ -397,31 +403,83 @@ Session can be:
      (t
       module))))
 
-(defun julia-snail-ob--place-result (result org-buffer reqid params)
-  "Place org-babel RESULT in ORG-BUFFER.
+;;;; Result placement
 
-PARAMS are the parameters of evaluation and REQID identifies the
-source block."
-  (save-window-excursion
-    (switch-to-buffer org-buffer)
-    (save-excursion
-      (save-restriction
-        (widen) ;; Otherwise substitution may fail
-      	(goto-char (point-max))
-      	(when (search-backward (concat "julia-async:" reqid) nil t)
-      	  ;; Remove reqid string if result-type is raw, as ob-core doesn't do it
-          (when (member "raw" (alist-get :result-params params))
-            (delete-region (match-beginning 0) (match-end 0)))
-          ;; Remove results
-      	  (search-backward "#+end_src")
-          ;; Insert new one
-          (org-babel-insert-result
-           ;; (julia-snail-ob-process-results params output-file)    ;=> result string
-           result
-           (alist-get :result-params params)                      ;=> result params
-           (list nil nil params)                                  ;=> block info
-           nil "julia")                                           ;=> hash and lang
-          (run-hooks 'julia-snail-ob-after-async-execute-hook))))))
+;; From `jupyter-org-with-point-at'
+(defmacro julia-snail-ob-with-point-at (req &rest body)
+  "Move to the associated marker of REQ while evaluating BODY.
+If the marker points nowhere don't evaluate BODY, just do
+nothing and return nil."
+  (declare (indent 1) (debug (form body)))
+  `(pcase-let (((cl-struct julia-snail-request marker) ,req))
+     (when (and (marker-buffer marker) (marker-position marker))
+       (org-with-point-at marker
+         ,@body))))
+
+(defun julia-snail-ob--remove-placeholder (request)
+  (julia-snail-ob-with-point-at request
+    (let ((reqid (julia-snail-request-id request)))
+      (when (search-forward (concat "julia-async:" reqid) nil t)
+        (delete-region (line-beginning-position) (1+ (line-end-position)))))))
+
+(defun julia-snail-ob--goto-result ()
+  (goto-char (org-babel-where-is-src-block-result 'insert))
+  (forward-line 1) ; Skip past the #+RESULTS line
+  (unless (bolp) (insert "\n")))
+
+(defun julia-snail-ob--format-result (text)
+  (let ((text (format "%s" text)))
+    ;; From `org-element-fixed-width-interpreter'
+    (concat
+     (if (string-empty-p text) ":"
+       (replace-regexp-in-string "^" ": " text))
+     "\n")))
+
+(defun julia-snail-ob--place-result (request &optional result)
+  "Place RESULT of julia snail REQUEST.
+If RESULT is nil, place result stored in REQUEST's data slot."
+  (when-let* ((result (or result
+                          (when-let* ((data (julia-snail-request-data request)))
+                            (julia-snail--request-data-result data)))))
+    (let* ((properties (julia-snail-request-babel-props request))
+           (params (plist-get properties :params))
+           (output-file (plist-get properties :output-file)))
+      (julia-snail-ob-with-point-at request
+        (julia-snail-ob--goto-result)
+        (insert (julia-snail-ob--format-result result))
+        (run-hooks 'julia-snail-ob-after-async-execute-hook)))))
+
+(defun julia-snail-ob--place-stream (request)
+  "Places the contents of REQUEST's stream buffer in the results."
+  (when-let* ((data (julia-snail-request-data request))
+              (stream-buf (julia-snail--request-data-stream-buf data))
+              (stream-str (with-current-buffer stream-buf
+                            (buffer-string))))
+    (julia-snail-ob-with-point-at request
+      (julia-snail-ob--goto-result)
+      (if-let* ((result-end (org-babel-result-end))
+                (stream-ov (car (ov-in 'julia-snail-stream t (point) result-end))))
+          (replace-region-contents
+           (ov-beg stream-ov) (ov-end stream-ov)
+           (julia-snail-ob--format-result stream-str)
+           nil nil 'inherit)
+        (let* ((beg (point))
+               (end (progn
+                      (insert (julia-snail-ob--format-result stream-str))
+                      (point)))
+               (ov (make-overlay beg end)))
+          ;; (overlay-put ov 'face 'dired-marked)
+          (overlay-put ov 'julia-snail-stream t))))))
+
+;; From `jupyter-org-request-at-point'
+(defun julia-snail-ob-request-at-point ()
+  (when-let* ((context (org-element-context))
+              (babel-p (memq (org-element-type context)
+                             '(src-block babel-call
+                                         inline-babel-call inline-src-block)))
+              (pos (jupyter-org-element-begin-after-affiliated context))
+              (req (get-text-property pos 'julia-snail-request)))
+    req))
 
 ;;;; Backend functions
 
@@ -512,38 +570,38 @@ Unless an output file is explicitly specified with the header arg
 
 (defun julia-snail-ob-evaluate-in-session:async (session module body output-file params)
   "Run BODY in session SESSION asynchronously, return placeholder string."
-  (let* ((reqid 
-          (julia-snail--send-to-server
-            module
-            body
-            :repl-buf (concat "*" session "*")
-            :async t
-            :display-error-buffer-on-failure? t
-            :babel-props (list :params params :output-file output-file)
-            :callback-success #'julia-snail-ob-success-callback
-            :callback-failure #'julia-snail-ob-failure-callback)))
-    (concat "julia-async:" reqid)))
+  (let ((req
+         (julia-snail--send-to-server
+           module
+           body
+           :repl-buf (concat "*" session "*")
+           :async t
+           :display-error-buffer-on-failure? t
+           :babel-props (list :params params :output-file output-file)
+           :marker (copy-marker org-babel-current-src-block-location)
+           :callback-success #'julia-snail-ob-success-callback
+           :callback-failure #'julia-snail-ob-failure-callback
+           :callback-stream  #'julia-snail-ob-stream-callback
+           )))
+    (put-text-property
+     org-babel-current-src-block-location
+     (1+ org-babel-current-src-block-location)
+     'julia-snail-request req)
+    ;; TODO Add overlay to src block to prevent editing
+    (concat "julia-async:" (julia-snail-request-id req))))
 
-(defun julia-snail-ob-success-callback (request result-data)
+(defun julia-snail-ob-success-callback (request result)
   "A function that is called when julia-snail response is available."
-  (if (not result-data)
-      (message "Code block produced no output.")
-    (let* (
-           ;; (mime-type (read result-data))
-           (reqid (julia-snail--request-tracker-id request))
-           (org-buffer (julia-snail--request-tracker-origin-buf request))
-           (display-errors (julia-snail--request-tracker-display-error-buffer-on-failure?
-                            request))
-           (properties (julia-snail--request-tracker-babel-props request))
-           (params (plist-get properties :params))
-           (output-file (plist-get properties :output-file)))
-      ;; Rename the output file heuristically by mime-type
-      ;; (setq output-file
-      ;;       (julia-snail-ob--maybe-rename-output output-file mime-type params))
-      (julia-snail-ob--place-result result-data org-buffer reqid params))))
+  (julia-snail-ob--remove-placeholder request)
+  (when result
+    (julia-snail-ob--place-result request result)))
+
+(defun julia-snail-ob-stream-callback (request type)
+  (julia-snail-ob--remove-placeholder request)
+  (julia-snail-ob--place-stream request))
 
 (defun julia-snail-ob-failure-callback (request)
-  (when-let ((tmpfile (julia-snail--request-tracker-tmpfile request)))
+  (when-let ((tmpfile (julia-snail-request-tmpfile request)))
     (and (file-exists-p tmpfile) (delete-file tmpfile))))
 
 (defun julia-snail-ob--maybe-make-raw (params)
@@ -558,14 +616,34 @@ Note: PARAMS is modified in the process."
         (alist-get :result-params params)))
   params)
 
-;; Main entry point when code is evaluated in an Org Mode buffer
+(defun julia-snail-ob-cleanup-file-links ()
+  "Delete the files of image links for the current source block result.
+Do this only if the file exists in
+`julia-snail-ob-resource-directory'."
+  (when-let*
+      ((pos (org-babel-where-is-src-block-result))
+       (link-re (format "^[ \t]*%s[ \t]*$" org-link-bracket-re))
+       (resource-dir (expand-file-name julia-snail-ob-resource-directory)))
+    (save-excursion
+      (goto-char pos)
+      (forward-line)
+      (let ((bound (org-babel-result-end)))
+        ;; This assumes that images links are bracketed
+        (while (re-search-forward link-re bound t)
+          (when-let*
+              ((path (org-element-property :path (org-element-context)))
+               (dir (when (file-name-directory path)
+                      (expand-file-name (file-name-directory path)))))
+            (when (and (equal dir resource-dir) (file-exists-p path))
+              (delete-file path))))))))
+
 (defun org-babel-execute:julia (block params)
   "Execute a block of julia code using Julia Snail.
 
 BLOCK is the content of the src block
 PARAMS are the parameter passed to the block"
-  ;; TODO: if the block already has a julia-async link, it would be
-  ;; nice to interrupt it and start the new one.
+  (when (member "replace" (assq :result-params params))
+    (julia-snail-ob-cleanup-file-links))
   (let* ((params (julia-snail-ob--maybe-make-raw params))
          (session (julia-snail-ob-get-session-name params))
          (module (julia-snail-ob-get-module-str params))
@@ -582,7 +660,7 @@ PARAMS are the parameter passed to the block"
          (babel-params (julia-snail-ob-params->named-tuple params)))
 
     ;; If the session does not exists, start it
-    (when (not (julia-snail-ob--get-live-session session))
+    (unless (julia-snail-ob--get-live-session session)
       (org-babel-prep-session:julia session params))
 
     ;; Ensure module exists
