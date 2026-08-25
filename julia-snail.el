@@ -297,12 +297,13 @@ nil means disable Snail-specific imenu integration (fall back on julia-mode impl
          julia-snail--julia-files-local))
 
 
-;;;; Supporting data structures
+;;;; Data structures
 
 (cl-defstruct julia-snail--request-data
   "Stores result and stream (stdout+stderr) of a request."
   stream-buf
   result
+  displays
   finalizer)
 
 (cl-defstruct julia-snail-request
@@ -313,6 +314,7 @@ nil means disable Snail-specific imenu integration (fall back on julia-mode impl
   (callback-success (lambda (&optional _data) (message "Snail command succeeded")))
   (callback-failure (lambda () (message "Snail command failed")))
   callback-stream
+  callback-display
   (display-error-buffer-on-failure? t)
   babel-props
   data
@@ -1031,7 +1033,8 @@ wait for the REPL prompt to return, otherwise return immediately."
      srcbuf-ov
      callback-success
      callback-failure
-     callback-stream)
+     callback-stream
+     callback-display)
   "Send STR to Snail server, and evaluate it in the context of MODULE.
 Run callback-success and callback-failure as appropriate.
 When :async is t (default), return the request id. When :async is
@@ -1092,6 +1095,7 @@ nil, wait for the result and return it."
                  :data data
                  :display-error-buffer-on-failure? display-error-buffer-on-failure?
                  :callback-stream callback-stream
+                 :callback-display callback-display
                  :callback-success (lambda (req &optional data)
                                      (unless async
                                        (setq res (or data :nothing)))
@@ -1212,7 +1216,14 @@ evaluated in the context of MODULE."
            (throw 'julia-snail--server-filter-error err)))))))
 
 
-;;;; Snail server response handling functions
+;;;; Server response handling
+
+;; When a request is send to evaluate some code, we can get various kind of responses:
+;; 1. Request response: The final evaluation result
+;; 2. Stdout and stderr streams
+;; 3. Multimedia displays
+
+;;;;; Request response
 
 (defun julia-snail--response-base (reqid)
   "Snail response handler for REQID, base function."
@@ -1263,37 +1274,10 @@ evaluated in the context of MODULE."
   "Snail task interruption response handler for REQID."
   (julia-snail--response-base reqid))
 
-;;;; Snail server stream handling
+;;;;; Stdout and stderr stream
 
-;; Taken from `jupyter-handle-control-codes'
-(defun jupyter-snail--handle-control-codes (beg end)
-  "Handle any control sequences between BEG and END."
-  (save-excursion
-    (goto-char beg)
-    (while (< (point) end)
-      (let ((char (char-after)))
-        (cond
-         ((eq char ?\r)
-          (if (< (1+ (point)) end)
-              (if (memq (char-after (1+ (point)))
-                        '(?\n ?\r))
-                  (delete-char 1)
-                (let ((end (1+ (point))))
-                  (beginning-of-line)
-                  (delete-region (point) end)))
-            (add-text-properties (point) (1+ (point))
-                                 '(invisible t))
-            (forward-char)))
-         ((eq char ?\a)
-          (delete-char 1)
-          (beep))
-         ((eq char ?\C-h)
-          (delete-region (1- (point)) (1+ (point))))
-         (t
-          (forward-char)))))))
-
-;; TODO When we implement passing source (stdout/stderr), encode stderr text with red face
-(defun julia-snail--stream (reqid type chunk)
+;; TODO Encode stderr text with red face
+(defun julia-snail--response-stream (reqid type chunk)
   "Store the stream CHUNK of request with id REQID in its data slot.
 
 This handles escape sequences, though ansi coloring is not applied, as
@@ -1335,6 +1319,16 @@ this uses overlays which cannot be copied over with (buffer-string)."
     (when-let* ((ov (julia-snail-request-srcbuf-ov req)))
       (julia-snail-srcbuf-ov--update ov))))
 
+;;;;; Display
+
+;; TODO Integrate with multimedia code
+
+(defun julia-snail--response-display (reqid type value)
+  (when-let* ((req (gethash reqid julia-snail--requests))
+              (data (julia-snail-request-data req)))
+    (push (cons type value) (julia-snail--request-data-displays data))
+    (when-let* ((callback (julia-snail-request-callback-display req)))
+      (funcall callback req type value))))
 
 
 ;;;; CST parser interface

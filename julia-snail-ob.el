@@ -1,4 +1,4 @@
-;;; julia-snail-ob --- Org Babel support for Julia Snail
+;;; julia-snail-ob --- Org Babel support for Julia Snail  -*- lexical-binding: t; -*-
 
 ;;; Commentary:
 
@@ -403,6 +403,28 @@ Session can be:
      (t
       module))))
 
+;;;; Org helpers
+
+;; From `jupyter-org-element-begin-after-affiliated'
+(defun julia-snail-ob-element-begin-after-affiliated (element)
+  "Return the beginning position of ELEMENT after any affiliated keywords."
+  (or (org-element-property :post-affiliated element)
+      (org-element-property :begin element)))
+
+;; From `jupyter-org-element-end-before-blanks'
+(defun julia-snail-ob-element-end-before-blanks (element)
+  "Return the end position of ELEMENT, before any :post-blank lines."
+  (- (org-element-property :end element)
+     (or (org-element-property :post-blank element) 0)))
+
+;; From `jupyter-org-element-contents-end'
+(defun julia-snail-ob-element-contents-end (element)
+  "Return the end position for the contents of ELEMENT in the current buffer."
+  (or (org-element-property :contents-end element)
+      (save-excursion
+        (goto-char (julia-snail-ob-element-end-before-blanks element))
+        (line-beginning-position 0))))
+
 ;;;; Result placement
 
 ;; From `jupyter-org-with-point-at'
@@ -429,29 +451,65 @@ nothing and return nil."
     (goto-char (org-babel-result-end)))
   (unless (bolp) (insert "\n")))
 
-(defun julia-snail-ob--format-result (text)
+(defun julia-snail-ob--format-fixed-width (text)
   (let ((text (format "%s" text)))
     ;; From `org-element-fixed-width-interpreter'
     (concat
      (if (string-empty-p text) ":\n"
-       (replace-regexp-in-string "^" ": " text))
-     ;; "\n"
-     )))
+       (replace-regexp-in-string "^" ": " text)))))
 
-(defun julia-snail-ob--place-result (request &optional result)
-  "Place RESULT of julia snail REQUEST.
-If RESULT is nil, place result stored in REQUEST's data slot."
-  (when-let* ((result (or result
-                          (when-let* ((data (julia-snail-request-data request)))
-                            (julia-snail--request-data-result data)))))
-    (let* ((properties (julia-snail-request-babel-props request))
-           (params (plist-get properties :params))
-           (output-file (plist-get properties :output-file)))
-      (julia-snail-ob-with-point-at request
-        (julia-snail-ob--goto-result 'end)
-        (insert (julia-snail-ob--format-result result))
-        (run-hooks 'julia-snail-ob-after-async-execute-hook)))))
+(defun julia-snail-ob--format-result (type value)
+  (if-let* ((orgval (pcase type
+                      ('image (format "[[file:%s]]" value)))))
+      (cons orgval t)
+    (cons value nil)))
 
+(defun julia-snail-ob--insert (type value)
+  (pcase-let ((`(,result . ,org-p) (julia-snail-ob--format-result type value))
+              (context (org-element-context)))
+    (cond
+     ;; Empty line below #+RESULTS:
+     ((and (eq (org-element-type context) 'keyword)
+           (string= (org-element-property :key context) "RESULTS"))
+      (let ((beg (point)))
+        (insert (if org-p result (julia-snail-ob--format-fixed-width result)) "\n")
+        (cons beg (point))))
+     ;; Results in fixed-width element (": xxx")
+     ((eq (org-element-type context) 'fixed-width)
+      (if (not org-p)
+          (progn
+            (goto-char (org-babel-result-end))
+            (let ((beg (point)))
+              (insert (julia-snail-ob--format-fixed-width result) "\n")
+              (cons beg (point))))
+        (insert ":RESULTS:\n")
+        (goto-char (org-babel-result-end))
+        (let ((beg (point))
+              end)
+          (insert result "\n")
+          (setq end (point))
+          (insert ":END:\n")
+          (cons beg end))))
+     ;; RESULTS drawer. Append within drawer
+     ((and (eq (org-element-type context) 'drawer)
+           (string= (org-element-property :drawer-name context)
+                    "RESULTS"))
+      (goto-char (julia-snail-ob-element-contents-end context))
+      (let ((beg (point)))
+        (insert result "\n")
+        (cons beg (point)))))))
+
+(defun julia-snail-ob--place-result (request type result)
+  "Place RESULT of julia snail REQUEST."
+  (let* ((properties (julia-snail-request-babel-props request))
+         (params (plist-get properties :params))
+         (output-file (plist-get properties :output-file)))
+    (julia-snail-ob-with-point-at request
+      (julia-snail-ob--goto-result)
+      (julia-snail-ob--insert type result)
+      (run-hooks 'julia-snail-ob-after-async-execute-hook))))
+
+;; TODO Place in begin_out / begin_err blocks?
 (defun julia-snail-ob--place-stream (request)
   "Places the contents of REQUEST's stream buffer in the results."
   (when-let* ((data (julia-snail-request-data request))
@@ -471,21 +529,49 @@ If RESULT is nil, place result stored in REQUEST's data slot."
              (ov-beg stream-ov) (ov-end stream-ov)
              " ")
             (goto-char (ov-beg stream-ov))
-            (insert (julia-snail-ob--format-result stream-str)))
-        (let* ((beg (point))
-               (end (progn
-                      (insert (julia-snail-ob--format-result stream-str))
-                      (point)))
-               (ov (make-overlay beg end)))
+            (insert (julia-snail-ob--format-fixed-width stream-str) "\n"))
+        (pcase-let* ((`(,beg . ,end) (julia-snail-ob--insert 'raw stream-str))
+                     (ov (make-overlay beg end)))
           (overlay-put ov 'evaporate t)
           ;; (overlay-put ov 'face 'dired-marked)
           (overlay-put ov 'julia-snail-stream t))))))
 
-;; From `jupyter-org-element-begin-after-affiliated'
-(defun julia-snail-ob--element-begin-after-affiliated (element)
-  "Return the beginning position of ELEMENT after any affiliated keywords."
-  (or (org-element-property :post-affiliated element)
-      (org-element-property :begin element)))
+;; NOTE Ended up doing this lazy approach rather than appending results as they
+;; come in, which is what the code above is for. It ended up being too fragile
+;; (results coming in at the same time, parsing logic, etc). Since we store
+;; everything in the request object anyway its easier to just copy it over any
+;; time we get something new.
+(defun julia-snail-ob-place-results (&optional req)
+  "Replace the results with the results stored in REQ's data."
+  (when-let* ((req (or req (julia-snail-ob-request-at-point)))
+              (data (julia-snail-request-data req)))
+    (with-slots (result stream-buf displays) data
+      (julia-snail-ob-with-point-at req
+        (org-babel-remove-result)
+        (julia-snail-ob--goto-result)
+        (let ((beg (point))
+              (content
+               (with-work-buffer
+                 (when-let* ((stream-str (with-current-buffer stream-buf
+                                           (buffer-string))))
+                   (unless (string-empty-p stream-str)
+                     (insert stream-str)))
+                 (dolist (d displays)
+                   (unless (bolp) (insert "\n"))
+                   (insert (car (julia-snail-ob--format-result (car d) (cdr d)))))
+                 (when result
+                   (unless (bolp) (insert "\n"))
+                   (insert (format "%s" result)))
+                 (buffer-string))))
+          (if displays
+              (insert ":RESULTS:\n" content "\n:END:\n")
+            (insert (julia-snail-ob--format-fixed-width content) "\n"))
+          ;; TODO Copy code this code to julia snail
+          ;; The jupyter variant doesnt remove the escape codes so that the
+          ;; colors are rendered when opening the file again.
+          (jupyter-ansi-color-apply-on-region beg (point))
+          (org-link-preview nil beg (point))
+          )))))
 
 ;; From `jupyter-org-request-at-point'
 (defun julia-snail-ob-request-at-point ()
@@ -494,7 +580,7 @@ If RESULT is nil, place result stored in REQUEST's data slot."
               (babel-p (memq (org-element-type context)
                              '(src-block babel-call
                                          inline-babel-call inline-src-block)))
-              (pos (julia-snail-ob--element-begin-after-affiliated context))
+              (pos (julia-snail-ob-element-begin-after-affiliated context))
               (req (get-text-property pos 'julia-snail-request)))
     (when (called-interactively-p 'interactive)
       (pp-eval-expression req))
@@ -599,8 +685,9 @@ Unless an output file is explicitly specified with the header arg
            :babel-props (list :params params :output-file output-file)
            :marker (copy-marker org-babel-current-src-block-location)
            :callback-success #'julia-snail-ob-success-callback
-           :callback-stream  #'julia-snail-ob-stream-callback
            :callback-failure #'julia-snail-ob-failure-callback
+           :callback-stream #'julia-snail-ob-stream-callback
+           :callback-display #'julia-snail-ob-display-callback
            )))
     (put-text-property
      org-babel-current-src-block-location
@@ -612,11 +699,21 @@ Unless an output file is explicitly specified with the header arg
   "A function that is called when julia-snail response is available."
   (julia-snail-ob--remove-placeholder request)
   (when result
-    (julia-snail-ob--place-result request result)))
+    ;; (julia-snail-ob--place-result request 'raw (format "%s" result))
+    (julia-snail-ob-place-results request)
+    ))
 
 (defun julia-snail-ob-stream-callback (request type)
   (julia-snail-ob--remove-placeholder request)
-  (julia-snail-ob--place-stream request))
+  ;; (julia-snail-ob--place-stream request)
+  (julia-snail-ob-place-results request)
+  )
+
+(defun julia-snail-ob-display-callback (request type value)
+  (julia-snail-ob--remove-placeholder request)
+  ;; (julia-snail-ob--place-result request type value)
+  (julia-snail-ob-place-results request)
+  )
 
 (defun julia-snail-ob-failure-callback (request)
   (when-let ((tmpfile (julia-snail-request-tmpfile request)))

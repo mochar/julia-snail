@@ -169,7 +169,7 @@ function Base.flush(s::RequestStream)
     lock(s.lock) do
         if s.buffer.size > 0
             chunk = String(take!(s.buffer))
-            resp = elexpr([Symbol("julia-snail--stream"), s.reqid, repr(s.type), chunk])
+            resp = elexpr([Symbol("julia-snail--response-stream"), s.reqid, repr(s.type), chunk])
             println(s.client, resp)
         end
     end
@@ -839,7 +839,7 @@ end
 end
 
 
-### Multimedia display
+### Display
 
 module Multimedia
 
@@ -854,15 +854,14 @@ const EMACS = EmacsDisplay()
 
 const SUPPORTED_MIMES = ["image/png", "image/svg+xml"]
 
-function Base.display(d::EmacsDisplay, mime::MIME, img)
-    string(mime) in SUPPORTED_MIMES || throw(MethodError(Base.display, (d, mime, img)))
+function Base.display(d::EmacsDisplay, mime::MIME, x)
+    string(mime) in SUPPORTED_MIMES || throw(MethodError(Base.display, (d, mime, x)))
     
     request = CURRENT_REQUEST[]
-
-    if request === nothing
-        throw(MethodError(Base.display, (EMACS, mime, img)))
-    elseif request.babel === nothing
-        img_encoded = Base64.base64encode(show, mime, img)
+    request === nothing && throw(MethodError(Base.display, (d, mime, x)))
+        
+    if request.babel === nothing
+        img_encoded = Base64.base64encode(show, mime, x)
         el = Main.JuliaSnail.elexpr([
             Symbol("julia-snail-multimedia-display"),
             img_encoded,
@@ -875,20 +874,26 @@ function Base.display(d::EmacsDisplay, mime::MIME, img)
         mkpath(dir)
         output_file = joinpath(dir, "$(request.reqid)_$(count).png")
         open(output_file, "w") do io
-            show(io, mime, img)
+            show(io, mime, x)
         end
-        println(request.stdout, "[[file:$(output_file)]]")        
+        el = Main.JuliaSnail.elexpr([
+            Symbol("julia-snail--response-display"),
+            request.reqid,
+            Symbol("'image"),
+            output_file
+        ])
+        println(request.client, el)
     end
 end
 
-function Base.display(d::EmacsDisplay, img)
+function Base.display(d::EmacsDisplay, x)
     for mime in SUPPORTED_MIMES
-        if showable(mime, img)
-            display(d, MIME(mime), img) 
+        if showable(mime, x)
+            display(d, MIME(mime), x) 
             return
         end
     end
-    throw(MethodError(Base.display, (d, img)))
+    throw(MethodError(Base.display, (d, x)))
 end
 
 """
