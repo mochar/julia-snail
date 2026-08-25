@@ -2,16 +2,67 @@
 
 module ObJulia
 
+import Base.display
+
+### Sexp
+# The heavy-lifting of converting types to elisp happens here
+
+"`string()` wrapper which escapes unsupported characters:
+- `|`s are replaced by `\\vert{}`
+- newlines are replaced by ` `"
+function stringify(text)
+    # To my understanding, newline is not supported inside cells, so we drop it
+    reduce(replace,
+           ('|' => "\\vert{}", "\n" => " "),
+           init=string(text))
+end
+
+# TODO: instead of converting to string, convert them to a Sexp type,
+# so that we can modify it before converting to string
+wrap(x) = string("(", stringify(x), ")")
+wrap(t::Tuple) = lst(t)
+lisp(i) = i
+lisp(i::Number) = i
+lisp(n::Nothing) = "nil"
+lisp(s::AbstractString) = string("\"", reduce(replace, ('\\' => "\\\\", '"' => "\\\""), init=s), "\"")
+lst(x) = wrap(join(lisp.(x), " "))
+lst(s::AbstractString) = wrap(lisp(s))
+
+sexp(t::Tuple) = lst(t)
+# sexp(a::AbstractVector) = wrap(join(wrap.(lisp.(stringify.(a))), " "))
+sexp(a::AbstractVector) = wrap(join(lisp.(a), " "))
+sexp(a::AbstractMatrix) =
+    wrap(join([wrap(join(ObJulia.lisp.(ObJulia.stringify.(r)), " "))
+               for r in eachrow(a)], " "))
+sexp(s::StepRange) = wrap(join(wrap.(s), " "))
+sexp(nt::NamedTuple) = wrap(join([wrap((k, nt[k])) for k in keys(nt)], " ")) 
+sexp(a::Any) = "\"WARNING: Type $(typeof(a)) cannot be converted to sexp by ob-julia.\""
+
 ### Display
 
-import Base.display
+"Return a function which takes two arguments, the display and the
+content to write to.  That function writes the content to the display,
+prepended by the type `t`."
+function write_type(t)
+    "Writes `t` followed by content to `d`."
+    function wrt(d::ObJuliaDisplay, content="")
+        println(d.io, t)
+        write(d.io, content)
+    end
+    return wrt
+end
+raw = write_type("raw")
+table = write_type("table")
+matrix = write_type("matrix")
+verbatim = write_type("verbatim")
+list = write_type("list")
 
 struct ObJuliaDisplay <: AbstractDisplay
     io::IO
 end
 
-# Display fallback for types we do not support
-function display(d::ObJuliaDisplay, Any, x; kwargs...)
+"""Display fallback for types we do not support."""
+function display(d::ObJuliaDisplay, m, x; kwargs...)
     verbatim(d)
     show(d.io, x)
 end
@@ -49,41 +100,7 @@ function display(d::ObJuliaDisplay, ::MIME"text/org+latexify", x::T; kwargs...) 
     display(d, MIME("text/org"), x; kwargs...)
 end
 
-### Sexp
-# The heavy-lifting of converting types to elisp happens here
-
-"`string()` wrapper which escapes unsupported characters:
-- `|`s are replaced by `\\vert{}`
-- newlines are replaced by ` `"
-function stringify(text)
-    # To my understanding, newline is not supported inside cells, so we drop it
-    reduce(replace,
-           ('|' => "\\vert{}", "\n" => " "),
-           init=string(text))
-end
-
-# TODO: instead of converting to string, convert them to a Sexp type,
-# so that we can modify it before converting to string
-wrap(x) = string("(", stringify(x), ")")
-wrap(t::Tuple) = lst(t)
-lisp(i) = i
-lisp(i::Number) = i
-lisp(n::Nothing) = "nil"
-lisp(s::AbstractString) = string("\"", reduce(replace, ('\\' => "\\\\", '"' => "\\\""), init=s), "\"")
-lst(x) = wrap(join(lisp.(x), " "))
-lst(s::AbstractString) = wrap(lisp(s))
-
-sexp(t::Tuple) = lst(t)
-# sexp(a::AbstractVector) = wrap(join(wrap.(lisp.(stringify.(a))), " "))
-sexp(a::AbstractVector) = wrap(join(lisp.(a), " "))
-sexp(a::AbstractMatrix) =
-    wrap(join([wrap(join(ObJulia.lisp.(ObJulia.stringify.(r)), " "))
-               for r in eachrow(a)], " "))
-sexp(s::StepRange) = wrap(join(wrap.(s), " "))
-sexp(nt::NamedTuple) = wrap(join([wrap((k, nt[k])) for k in keys(nt)], " ")) 
-sexp(a::Any) = "\"WARNING: Type $(typeof(a)) cannot be converted to sexp by ob-julia.\""
-
-### Base
+### Display: Base
 
 # Display functions for types defined in Julia base
 display(d::ObJuliaDisplay, ::MIME"text/org", t::Tuple; kwargs...) =
@@ -148,7 +165,7 @@ function display(d::ObJuliaDisplay, ::MIME"text/org", a::AbstractDict; kwargs...
     table(d, wrap(join(wrap.(reverse(join.([[lisp(stringify(k)), lisp(stringify(v))] for (k, v) in a], " "))), " ")))
 end
 
-### Stdlib
+### Display: Stdlib
 
 # Display function for types defined in Julia standard library
 using Dates
@@ -168,9 +185,9 @@ display(d::ObJuliaDisplay, ::MIME"text/org", i::T;
 # days (d), weeks (w), months (m), or years (y)
 unit(x::Day) = "d"; unit(x::Week) = "w"; unit(x::Month) = "m"; unit(x::Year) = "y";
 
-### Packages
+### Display: Packages
 
-# External (non-Stdlib) packages support
+# External packages support
 # To add support for new packages:
 # 1. Add the package name as a Symbol in the supported_packages array
 # 2. Add a define_$pkg function
@@ -186,6 +203,11 @@ const supported_packages = [
     :Latexify, :LaTeXStrings,
     :Gadfly, :Plots, :Makie, :CairoMakie, :GLMakie, :WGLMakie]
 
+"""
+Map package symbol to mime types it can produce.
+
+This is used to determine the mime type from the evaluation result.
+"""
 const package_mimes = Dict(
     :Plots => MIME.(["image/gif",
                      "image/png",
@@ -348,7 +370,7 @@ function define_CairoMakie() define_Makie() end
 function define_GLMakie() define_Makie() end
 function define_WGLMakie() define_Makie() end
 
-### Main
+### Eval
 
 # Simple params accessors with fallback for src block params
 param(name, fallback) = p -> something(get(p, name, fallback), fallback)
@@ -366,25 +388,9 @@ result_is_auto(p) = all(.![result_is_raw(p),
                            result_is_table(p)])
 file_name = param(:file, nothing)
 
-# Result available result types
-
-"Return a function which takes two arguments, the display and the
-content to write to.  That function writes the content to the display,
-prepended by the type `t`."
-function write_type(t)
-    "Writes `t` followed by content to `d`."
-    function wrt(d::ObJuliaDisplay, content="")
-        println(d.io, t)
-        write(d.io, content)
-    end
-    return wrt
-end
-raw = write_type("raw")
-table = write_type("table")
-matrix = write_type("matrix")
-verbatim = write_type("verbatim")
-list = write_type("list")
-
+"""
+Map file extension to MIME. This is used to identify the file type.
+"""
 const MIMES = Dict(
     # keep those sorted :)
     ""     => MIME("text/org"),
@@ -473,6 +479,12 @@ function output_mime(filename, result; fallback="")
     end
 end
 
+"""
+Determine mime type based on evaluation result.
+
+This tests all mime types in `package_mimes` to see if the result can be
+displayed by it. The first mime type that can is returned.
+"""
 function auto_determine_mime(result)
     for pkg in keys(package_mimes)
         if isdefined(Main, pkg) && (isa(getfield(Main, pkg), Module) ||
@@ -579,5 +591,6 @@ function OrgBabelEval(src_file, output_file, params, async_uuid=nothing;
     end
 end
 
+### Tail
 
 end # module
