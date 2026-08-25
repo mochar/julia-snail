@@ -788,31 +788,6 @@ returns \"/home/username/file.jl\"."
       (format " Snail%s" (if extra extra "")))))
 
 
-;;;; Color shifting utilities
-
-;; Adapted from mini-frame.el
-
-(cl-defun julia-snail--color-shift (from to &key (by 27))
-  "Move color FROM towards TO by BY. FROM and TO are 16-bit integer values."
-  (let ((f (ash from -8)))
-    (cond
-     ((> from to) (- f by))
-     ((< from to) (+ f by))
-     (t f))))
-
-(cl-defun julia-snail--color-shift-hex (from to &key (by 27))
-  "Move color FROM towards TO. FROM and TO are hex values."
-  (if (or (string-match-p "^unspecified" (format "%s" from))
-          (string-match-p "^unspecified" (format "%s" to)))
-      "unspecified"
-    (let* ((from (color-values from))
-           (to (color-values to)))
-      (format "#%02x%02x%02x"
-              (julia-snail--color-shift (car from) (car to) :by by)
-              (julia-snail--color-shift (cadr from) (cadr to) :by by)
-              (julia-snail--color-shift (caddr from) (caddr to) :by by)))))
-
-
 ;;;; Connection management functions
 
 (defun julia-snail--clear-proc-caches (process-buf)
