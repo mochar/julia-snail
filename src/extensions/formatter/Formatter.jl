@@ -15,9 +15,10 @@ module Formatter
 
 import Base64
 
-Main.JuliaSnail.@with_pkg_env (@__DIR__) begin
-   import JuliaFormatter
-end
+import JuliaFormatter
+# Main.JuliaSnail.@with_pkg_env (@__DIR__) begin
+#    import JuliaFormatter
+# end
 
 function init()
    # initialization code can go here

@@ -1,5 +1,34 @@
+name = "JuliaSnail"
+uuid = "a1b2c3d4-e5f6-4a1b-b2c3-d4e5f6a1b2c3"
+version = "0.1.0"
+
 [deps]
+Base64 = "2a0f44e3-6c83-55bd-87e4-b1978d98bd5f"
 CSTParser = "00ebfdb7-1f24-5e51-bd34-a7502290713f"
+JuliaFormatter = "98e50ef6-434e-11e9-1051-2b60c6c9e899"
+Logging = "56ddb016-857b-54e1-b83d-db4d58db5568"
+Markdown = "d6f4376e-aef5-505a-96c1-9c027394607a"
+Match = "7eb4fadd-790c-5f42-8a69-bfa0b872bfbf"
+Printf = "de0858da-6303-5e67-8744-51eddeeeb8d7"
+REPL = "3fa0cd96-eef1-5676-8a61-b3b8758bbffb"
+Sockets = "6462fe0b-24de-5631-8697-dd941f90decc"
+
+[weakdeps]
+Latexify = "23fbe1c1-3f47-55db-b15f-69d7ec21a316"
+LaTeXStrings = "b964fa9f-0449-5b57-a5c2-d3ea65f4040f"
+Makie = "ee78f7c6-11fb-53f2-987a-cfe4a2b5a57a"
+
+[extensions]
+JuliaSnailLatexifyExt = ["Latexify", "LaTeXStrings"]
+JuliaSnailMakieExt = "Makie"
 
 [compat]
+Base64 = "1.11.0"
 CSTParser = "~3.4.2"
+JuliaFormatter = "2.13.0"
+Logging = "1.11.0"
+Markdown = "1.11.0"
+Match = "2.4.1"
+Printf = "1.11.0"
+REPL = "1.11.0"
+Sockets = "1.11.0"

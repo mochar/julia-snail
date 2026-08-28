@@ -35,6 +35,7 @@
 (require 'dash)
 (require 'easymenu)
 (require 'json)
+(require 'ov)
 (require 'pulse)
 (require 'rx)
 (require 's)
@@ -258,31 +259,32 @@ nil means disable Snail-specific imenu integration (fall back on julia-mode impl
 ;;;; Constants
 
 (defconst julia-snail--julia-files
-  ;; a slightly specialized directory walker to collect the correct file and directory list:
-  (cl-labels ((list-extension-files (&optional (path "extensions"))
-                 (let* ((result nil)
-                        (entries (cl-remove-if
-                                  (lambda (entry)
-                                    (or (string-match-p "^\\." (file-name-nondirectory entry))
-                                        (and (file-regular-p (concat (file-name-as-directory path) entry))
-                                             (not (or (string-equal "jl" (downcase (or (file-name-extension entry) "")))
-                                                      (string-equal "toml" (downcase (or (file-name-extension entry) ""))))))))
-                                  (directory-files path)))
-                        (qualified-entries (if (string-equal "." path)
-                                               entries
-                                             (mapcar (lambda (entry)
-                                                       (concat (file-name-as-directory path) entry))
-                                                     entries))))
-                   (cl-loop for entry in qualified-entries do
-                            (if (file-regular-p entry)
-                                (setq result (cons entry result))
-                              (when (file-directory-p entry)
-                                (setq result (cons entry result))
-                                (setq result (append result (list-extension-files entry))))))
-                   result)))
+  ;; A slightly specialized directory walker to collect the correct file and
+  ;; directory list:
+  (cl-labels ((list-extension-files (&optional (path "src/extensions"))
+                (let* ((result nil)
+                       (entries (cl-remove-if
+                                 (lambda (entry)
+                                   (or (string-match-p "^\\." (file-name-nondirectory entry))
+                                       (and (file-regular-p (concat (file-name-as-directory path) entry))
+                                            (not (or (string-equal "jl" (downcase (or (file-name-extension entry) "")))
+                                                     (string-equal "toml" (downcase (or (file-name-extension entry) ""))))))))
+                                 (directory-files path)))
+                       (qualified-entries (if (string-equal "." path)
+                                              entries
+                                            (mapcar (lambda (entry)
+                                                      (concat (file-name-as-directory path) entry))
+                                                    entries))))
+                  (cl-loop for entry in qualified-entries do
+                           (if (file-regular-p entry)
+                               (setq result (cons entry result))
+                             (when (file-directory-p entry)
+                               (setq result (cons entry result))
+                               (setq result (append result (list-extension-files entry))))))
+                  result)))
     ;; actually put together the list
     (append
-     (list "JuliaSnail.jl" "Project.toml" "extensions")
+     (list "src/JuliaSnail.jl" "Project.toml" "src/extensions")
      (let ((default-directory (file-name-directory (or load-file-name (buffer-file-name)))))
        (list-extension-files)))))
 
@@ -299,7 +301,14 @@ nil means disable Snail-specific imenu integration (fall back on julia-mode impl
 
 ;;;; Data structures
 
-(cl-defstruct julia-snail--request-data
+(cl-defstruct julia-snail-request-display
+  type
+  value
+  meta
+  counter
+  result-p)
+
+(cl-defstruct julia-snail-request-data
   "Stores result and stream (stdout+stderr) of a request."
   stream-buf
   result
@@ -383,6 +392,42 @@ Uses function `compilation-shell-minor-mode'.")
 
 (defvar julia-snail-mode)
 (defvar julia-snail-repl-mode)
+
+;;;; Request structure functions
+
+(defun julia-snail-request-make-display (request type value meta result-p)
+  (when value
+    (let* ((data (julia-snail-request-data request))
+           (displays (julia-snail-request-data-displays data)))
+      (make-julia-snail-request-display
+       :type type
+       :value value
+       :meta meta
+       :result-p result-p
+       :counter (length displays)))))
+
+(defun julia-snail-request-data-resolve (request-or-data)
+  (cond
+   ((julia-snail-request-p request-or-data)
+    (julia-snail-request-data request-or-data))
+   ((julia-snail-request-data-p request-or-data)
+    request-or-data)))
+  
+(defun julia-snail-request-data-options (request-or-data)
+  (pcase-let* ((data (julia-snail-request-data-resolve request-or-data))
+               ((cl-struct julia-snail-request-data
+                           displays result stream-buf) data)
+               (n-displays (length displays))
+               (stream-empty-p (= 0 (buffer-size stream-buf))))
+    (append
+     (unless stream-empty-p '(stream))
+     (number-sequence 0 (1- n-displays))
+     (when result '(result)))))
+
+(defun julia-snail-request-data-empty-p (request-or-data)
+  (null (julia-snail-request-data-options request-or-data)))
+
+
 
 
 ;;;; Supporting functions
@@ -566,20 +611,30 @@ Returns nil if the poll timed out, t otherwise."
 
 (defun julia-snail--send-helper (block-start block-end)
   (let ((text (buffer-substring-no-properties block-start block-end))
-        (filename (julia-snail--efn (buffer-file-name (buffer-base-buffer))))
-        (module (if current-prefix-arg :Main (julia-snail--module-at-point)))
-        (line-num (line-number-at-pos block-start)))
+        (module (if current-prefix-arg :Main (julia-snail--module-at-point))))
     (julia-snail--flash-region block-start block-end)
     (julia-snail--send-to-server
       module
       text
       :srcbuf-ov (when (julia-snail-srcbuf-ov-p) (cons block-start block-end))
+      :callback-stream
+      (lambda (request type)
+        (when-let* ((ov (julia-snail-request-srcbuf-ov request)))
+          (julia-snail-srcbuf-ov--update ov)))
+      :callback-display
+      (lambda (request display)
+        (when-let* ((ov (julia-snail-request-srcbuf-ov request)))
+          (julia-snail-srcbuf-ov-refresh ov)))
       :callback-success
-      (lambda (request &optional data)
-        (when-let ((res (and data (format "%s" data))))
+      (lambda (request result)
+        (when-let ((res (and result (format "%s" result))))
+          ;; Update overlay
+          (when-let* ((ov (julia-snail-request-srcbuf-ov request)))
+            (julia-snail-srcbuf-ov--update ov))
+            
           ;; Insert results when prefix arg
           (when (and (consp current-prefix-arg) (= (car current-prefix-arg) 4))
-            (let* ((parts (split-string res "\n"))
+            (let* ((parts (split-string result "\n"))
                    (str (mapconcat (lambda (part) (concat "# " part)) parts "\n")))
               (save-excursion
                 (end-of-line)
@@ -665,9 +720,16 @@ Returns nil if the poll timed out, t otherwise."
                               staged-server-file))
                         julia-snail--server-file)))
     (cond
-     ;; local REPL
-     ((equal nil remote-method)
-      (format "%s -i %s -L %s" julia-snail-executable extra-args server-file))
+     ;; Local REPL
+     ((null remote-method)
+      ;; (format "%s -i %s -L %s" julia-snail-executable extra-args server-file)
+      (let* ((src-dir (file-name-directory server-file))
+             (project-dir (file-name-directory (directory-file-name src-dir)))
+             (code (format
+                    "pushfirst!(LOAD_PATH, %S); import JuliaSnail; popfirst!(LOAD_PATH); push!(LOAD_PATH, %S)" 
+                    project-dir project-dir)))
+        (format "%s -i %s -e %S" julia-snail-executable extra-args code))
+      )
      ;; remote REPL
      ((or (string-equal "ssh" remote-method)
           (string-equal "sshx" remote-method)
@@ -790,7 +852,7 @@ returns \"/home/username/file.jl\"."
       (format " Snail%s" (if extra extra "")))))
 
 
-;;;; Connection management functions
+;;;; Connection management
 
 (defun julia-snail--clear-proc-caches (process-buf)
   "Clear connection-specific internal Snail xref, completion, and module caches."
@@ -939,7 +1001,7 @@ returns \"/home/username/file.jl\"."
   )
 
 
-;;;; Terminal emulator compatibility wrappers
+;;;; Terminal emulators
 
 (defun julia-snail--terminal-send-string (str)
   (cond
@@ -980,7 +1042,7 @@ returns \"/home/username/file.jl\"."
     (error "function called out of context; (with-current-buffer repl-buf ...) required"))))
 
 
-;;;; Julia REPL and Snail server interaction functions
+;;;; REPL and Snail server interaction
 
 (defun julia-snail--looking-back-string (str)
   "Return t if the buffer contents preceding point matches `str'. The same
@@ -1049,32 +1111,35 @@ nil, wait for the result and return it."
          (display-code-str (if julia-snail-debug
                                code-str
                              (s-truncate 80 code-str)))
-         (babel-str (if babel-props
-                        (json-encode-string
-                         (format "(params = %s, output_file = %S)"
-                                 (julia-snail-ob-params->named-tuple
-                                  (plist-get babel-props :params))
-                                 (plist-get babel-props :output-file)))
-                      "nothing"))
+         (origin-str (cond
+                      (babel-props
+                       (json-encode-string
+                        (format "Babel(%s, %S)"
+                                (julia-snail-ob-params->named-tuple
+                                 (plist-get babel-props :params))
+                                (plist-get babel-props :output-file))))
+                      (srcbuf-ov
+                       (json-encode-string "Srcbuf()"))
+                      (t "nothing")))
          (redirect-io-str (if redirect-io "true" "false"))
-         (msg (format "(ns = %s, reqid = \"%s\", code = %s, babel = %s, redirectio = %s)\n"
+         (msg (format "(ns = %s, reqid = \"%s\", code = %s, origin = %s, redirectio = %s)\n"
                       module-ns
                       reqid
                       code-str
-                      babel-str
+                      origin-str
                       redirect-io-str
                       ))
-         (display-msg (format "(ns = %s, reqid = \"%s\", code = %s, babel = %s, redirectio = %s)\n"
+         (display-msg (format "(ns = %s, reqid = \"%s\", code = %s, origin = %s, redirectio = %s)\n"
                               module-ns
                               reqid
                               display-code-str
-                              babel-str
+                              origin-str
                               redirect-io-str))
          (res-sentinel (gensym))
          (res res-sentinel)
          (req (let* ((stream-buf (generate-new-buffer
                                   (format " *julia-snail-stream-%s*" reqid)))
-                     (data (make-julia-snail--request-data
+                     (data (make-julia-snail-request-data
                             :stream-buf stream-buf
                             :finalizer (make-finalizer
                                         (lambda ()
@@ -1096,18 +1161,20 @@ nil, wait for the result and return it."
                  :display-error-buffer-on-failure? display-error-buffer-on-failure?
                  :callback-stream callback-stream
                  :callback-display callback-display
-                 :callback-success (lambda (req &optional data)
-                                     (unless async
-                                       (setq res (or data :nothing)))
-                                     (when (and callback-success (marker-buffer marker))
-                                       (with-current-buffer (marker-buffer marker)
-                                         (funcall callback-success req data))))
-                 :callback-failure (lambda (req)
-                                     (unless async
-                                       (setq res :nothing))
-                                     (when (and callback-failure (marker-buffer marker))
-                                       (with-current-buffer (marker-buffer marker)
-                                         (funcall callback-failure req))))))))
+                 :callback-success
+                 (lambda (req result)
+                   (unless async
+                     (setq res (or result :nothing)))
+                   (when (and callback-success (marker-buffer marker))
+                     (with-current-buffer (marker-buffer marker)
+                       (funcall callback-success req result))))
+                 :callback-failure
+                 (lambda (req)
+                   (unless async
+                     (setq res :nothing))
+                   (when (and callback-failure (marker-buffer marker))
+                     (with-current-buffer (marker-buffer marker)
+                       (funcall callback-failure req))))))))
     (with-current-buffer process-buf
       (goto-char (point-max))
       (insert display-msg))
@@ -1190,7 +1257,7 @@ evaluated in the context of MODULE."
   "Snail process filter for PROC given input STR; used as argument to `set-process-filter'."
   (when (buffer-live-p (process-buffer proc))
     (with-current-buffer (process-buffer proc)
-      ;; insert at the end unconditionally
+      ;; Insert at the end unconditionally
       (goto-char (point-max))
       (insert str)
       (set-marker (process-mark proc) (point))
@@ -1198,29 +1265,31 @@ evaluated in the context of MODULE."
       ;; may have been chunked. Assume that a successful read signals the end of
       ;; input, but a failed read needs to be concatenated to other upcoming
       ;; reads. Track them in a table hashed by the proc.
-      (let ((candidate (s-concat (gethash proc julia-snail--proc-responses) str)))
-        (condition-case-unless-debug err
-            (let ((read-str (read candidate)))
-              ;; read succeeds, so clean up and return its eval value
-              (remhash proc julia-snail--proc-responses)
-              ;; scary
-              (eval read-str))
-          ;; read failed due to end-of-file: this means more data is incoming; continue
-          (end-of-file
-           (puthash proc candidate julia-snail--proc-responses))
-          ;; If an unexpected error occurs at this point, it will have no normal
-          ;; condition-case context. Unfortunately, this leaves non-local
-          ;; transfer of control as the only way to notify the rest of the
-          ;; program that something went haywire.
-          (error
-           (throw 'julia-snail--server-filter-error err)))))))
+      (let ((candidate (s-concat (gethash proc julia-snail--proc-responses) str))
+            (pos 0))
+        (while (< pos (length candidate))
+          (condition-case-unless-debug err
+              (let* ((res (read-from-string candidate pos))
+                     (read-str (car res))
+                     (next-pos (cdr res)))
+                (setq pos next-pos)
+                (if (< pos (length candidate))
+                    (puthash proc (substring candidate pos) julia-snail--proc-responses)
+                  (remhash proc julia-snail--proc-responses))
+                (eval read-str))
+            (end-of-file
+             (puthash proc (substring candidate pos) julia-snail--proc-responses)
+             (setq pos (length candidate)))
+            (error
+             (throw 'julia-snail--server-filter-error err))))))))
 
 
 ;;;; Server response handling
 
-;; When a request is send to evaluate some code, we can get various kind of responses:
+;; When a request is send to evaluate some code, we can get various kind of
+;; responses:
 ;; 1. Request response: The final evaluation result
-;; 2. Stdout and stderr streams
+;; 2. Stdout and stderr stream
 ;; 3. Multimedia displays
 
 ;;;;; Request response
@@ -1228,23 +1297,18 @@ evaluated in the context of MODULE."
 (defun julia-snail--response-base (reqid)
   "Snail response handler for REQID, base function."
   (when-let* ((request (gethash reqid julia-snail--requests)))
-    ;; Delete tmpfile
     (when-let* ((tmpfile (julia-snail-request-tmpfile request)))
       (delete-file tmpfile))
-    ;; Stop spinner
     (with-current-buffer (marker-buffer (julia-snail-request-marker request))
       (spinner-stop))
-    ;; Remove request ID from requests hash
     (remhash reqid julia-snail--requests)))
 
 (defun julia-snail--response-success (reqid result)
   "Snail success response handler for REQID given RESULT."
-  (let* ((request (gethash reqid julia-snail--requests)))
-    (when-let* ((data (julia-snail-request-data request)))
-      (setf (julia-snail--request-data-result data) result)
-      ;; TODO Replace with callback
-      (when-let* ((ov (julia-snail-request-srcbuf-ov request)))
-        (julia-snail-srcbuf-ov--update ov)))
+  (let* ((request (gethash reqid julia-snail--requests))
+         (data (julia-snail-request-data request)))
+    (when (and data result)
+      (setf (julia-snail-request-data-result data) result))
     (when-let* ((callback-success (julia-snail-request-callback-success request)))
       (funcall callback-success request result)))
   (julia-snail--response-base reqid))
@@ -1284,7 +1348,7 @@ This handles escape sequences, though ansi coloring is not applied, as
 this uses overlays which cannot be copied over with (buffer-string)."
   (when-let* ((req (gethash reqid julia-snail--requests))
               (data (julia-snail-request-data req))
-              (buf (julia-snail--request-data-stream-buf data)))
+              (buf (julia-snail-request-data-stream-buf data)))
     (with-current-buffer buf
       (let ((inhibit-read-only t)
             (buffer-undo-list t) ; dont record undos
@@ -1314,21 +1378,20 @@ this uses overlays which cannot be copied over with (buffer-string)."
         
         (goto-char (point-max))))
     (when-let* ((callback (julia-snail-request-callback-stream req)))
-      (funcall callback req type))
-    ;; TODO Move this to stream callback
-    (when-let* ((ov (julia-snail-request-srcbuf-ov req)))
-      (julia-snail-srcbuf-ov--update ov))))
+      (funcall callback req type))))
 
 ;;;;; Display
 
 ;; TODO Integrate with multimedia code
 
-(defun julia-snail--response-display (reqid type value)
+(defun julia-snail--response-display (reqid type value meta result-p)
   (when-let* ((req (gethash reqid julia-snail--requests))
-              (data (julia-snail-request-data req)))
-    (push (cons type value) (julia-snail--request-data-displays data))
+              (data (julia-snail-request-data req))
+              (display (julia-snail-request-make-display
+                        req type value meta result-p)))
+    (push display (julia-snail-request-data-displays data))
     (when-let* ((callback (julia-snail-request-callback-display req)))
-      (funcall callback req type value))))
+      (funcall callback req display))))
 
 
 ;;;; CST parser interface
@@ -1378,7 +1441,7 @@ this uses overlays which cannot be copied over with (buffer-string)."
     res))
 
 
-;;;; Julia module tracking implementation
+;;;; Module tracking
 
 (defun julia-snail--module-merge-includes (current-filename includes)
   "Update file module cache using INCLUDES tree parsed from CURRENT-FILENAME."
@@ -1424,7 +1487,7 @@ this uses overlays which cannot be copied over with (buffer-string)."
       (or partial-module '("Main")))))
 
 
-;;;; Xref implementation
+;;;; Xref
 
 (defun julia-snail-xref-backend ()
   "Emacs xref API: return the Snail xref backend when Snail is usable."
@@ -1515,7 +1578,7 @@ this uses overlays which cannot be copied over with (buffer-string)."
     (julia-snail--make-xrefs-helper res)))
 
 
-;;;; Completion implementation
+;;;; Completion
 
 (defun julia-snail--repl-completions (identifier &optional module-finder)
   (let* ((module (if module-finder (apply module-finder (list)) (julia-snail--module-at-point)))
@@ -1553,7 +1616,7 @@ this uses overlays which cannot be copied over with (buffer-string)."
             :exclusive 'no))))
 
 
-;;;; Imenu enhancement
+;;;; Imenu
 
 ;; TODO: Add marginalia metadata. Use completion-extra-properties
 ;; :annotation-function for this? How, exactly?
@@ -1638,8 +1701,10 @@ this uses overlays which cannot be copied over with (buffer-string)."
 
 ;;;; Overlays in source buffers
 
-;; Show evaluation streams and results as overlays in source buffers.
-;; Straight up copy pasted from emacs-jupyter!
+;; NOTE Majority copy-pasted from emacs-jupyter!
+;; Show evaluation streams, displays, and result as overlays in source buffers.
+;; The overlay wraps the code region that was evaluated. The 'after-string
+;; property is used to display the result.
 
 (defface julia-snail-srcbuf-overlay
   '((((class color) (min-colors 88) (background light))
@@ -1655,8 +1720,17 @@ this uses overlays which cannot be copied over with (buffer-string)."
   :doc "Keymap for source buffer overlays."
   "S-RET" 'julia-snail-srcbuf-ov-toggle-folding
   "S-<return>" 'julia-snail-srcbuf-ov-toggle-folding
-  "M-RET" 'julia-snail-srcbuf-ov-toggle-type
-  "M-<return>" 'julia-snail-srcbuf-ov-toggle-type
+  "M-RET" 'julia-snail-srcbuf-ov-toggle-showing
+  "M-<return>" 'julia-snail-srcbuf-ov-toggle-showing
+  )
+
+(defconst julia-snail-srcbuf-ov-property 'julia-snail-eval
+  "Overlay property that holds `julia-snail-srcbuf-ov-state'.")
+
+(cl-defstruct julia-snail-srcbuf-ov-state
+  data ; julia-snail-request-data struct
+  (folded-p t) ; else expanded
+  showing ; nil, 'stream, 'result, or integer indicating display index
   )
 
 (defun julia-snail-srcbuf-ov--delete (ov &rest _)
@@ -1664,7 +1738,7 @@ this uses overlays which cannot be copied over with (buffer-string)."
 
 (defun julia-snail-srcbuf-ov--remove-all (beg end)
   (dolist (ov (overlays-in beg end))
-    (when (overlay-get ov 'julia-snail-eval)
+    (when (overlay-get ov julia-snail-srcbuf-ov-property)
       (julia-snail-srcbuf-ov--delete ov))))
 
 (defun julia-snail-srcbuf-ov--propertize (text &optional newline)
@@ -1687,25 +1761,31 @@ this uses overlays which cannot be copied over with (buffer-string)."
                      'face 'julia-snail-srcbuf-overlay)
                     )))
       ;; (add-face-text-property 0 (length display) 'underline t display)
+      
       ;; Ensure `point' doesn't move past the beginning or end of the overlay
       ;; on motion commands.
       (put-text-property 0 1 'cursor t display)
       (put-text-property (1- (length display)) (length display) 'cursor t display)
+      
       (propertize " " 'display display))))
 
 (defun julia-snail-srcbuf-ov--fold-boundary (text)
+  "Returns position of TEXT where remained should be invisible."
   (string-match-p "\n" text))
 
 (defun julia-snail-srcbuf-ov--fold-string (text)
+  "Add the 'invisible property to all but first part of TEXT.
+What consitutes the first part is determined using `julia-snail-srcbuf-ov--fold-boundary'."
   (when (eq buffer-invisibility-spec t)
     (setq buffer-invisibility-spec '(t)))
-  (unless (assoc 'julia-snail-eval buffer-invisibility-spec)
-    (push (cons 'julia-snail-eval t) buffer-invisibility-spec))
+  (unless (assoc julia-snail-srcbuf-ov-property buffer-invisibility-spec)
+    (push (cons julia-snail-srcbuf-ov-property t) buffer-invisibility-spec))
   (when-let* ((pos (julia-snail-srcbuf-ov--fold-boundary text)))
-    (put-text-property pos (length text) 'invisible 'julia-snail-eval text)
-    text))
+    (put-text-property pos (length text) 'invisible julia-snail-srcbuf-ov-property text))
+  text)
 
 (defun julia-snail-srcbuf-ov--expand-string (text)
+  "Removes the 'invisble property from TEXT."
   (prog1 text
     (put-text-property 0 (length text) 'invisible nil text)))
 
@@ -1715,78 +1795,78 @@ this uses overlays which cannot be copied over with (buffer-string)."
     (replace-regexp-in-string "\n+$" "")
     (replace-regexp-in-string "^\n+" "")))
 
-(defun julia-snail-srcbuf-ov--req-data-string (req-data &optional type)
-  (let* ((buf (julia-snail--request-data-stream-buf req-data))
-         (res (julia-snail--request-data-result req-data)))
-    (when-let* ((type (cond
-                       (type type)
-                       (res 'result)
-                       (buf 'stream)))
-                (text (if (eq type 'result)
-                          (format "%s" res)
-                        (with-current-buffer buf (buffer-string))))
-                (text (julia-snail-srcbuf-ov--clean-string text))
-                (text (ansi-color-apply text)))
-      text)))
-
-(defun julia-snail-srcbuf-ov--make (beg end req-data)
-  (let ((ov (make-overlay beg end nil t)))
-    (prog1 ov
-      (overlay-put ov 'evaporate t)
-      (overlay-put ov 'modification-hooks '(julia-snail-srcbuf-ov--delete))
-      (overlay-put ov 'insert-in-front-hooks '(julia-snail-srcbuf-ov--delete))
-      (overlay-put ov 'insert-behind-hooks '(julia-snail-srcbuf-ov--delete))
-      (overlay-put ov 'keymap julia-snail-srcbuf-overlay-keymap)
-      (if-let* ((text (julia-snail-srcbuf-ov--req-data-string req-data))
-                (folded (julia-snail-srcbuf-ov--fold-string text)))
-          (progn
-            (overlay-put ov 'after-string (julia-snail-srcbuf-ov--propertize text))
-            (overlay-put ov 'julia-snail-eval
-                         (list (if folded 'folded 'expanded) nil req-data)))
-        (overlay-put ov 'julia-snail-eval (list 'folded nil req-data))))))
+(defun julia-snail-srcbuf-ov--string (state)
+  "Return the string that will be displayed in the 'after-string ov property."
+  (pcase-let* (((cl-struct julia-snail-srcbuf-ov-state
+                           data showing folded-p) state)
+               ((cl-struct julia-snail-request-data
+                           stream-buf displays result) data)
+               (display (when (numberp showing) (nth showing displays)))
+               (text (cond
+                      ((eq showing 'stream)
+                       (with-current-buffer stream-buf (buffer-string)))
+                      ((eq showing 'result)
+                       result)
+                      ((and display
+                            (eq (julia-snail-request-display-type display) :text))
+                       (julia-snail-request-display-value display))
+                      ((and display folded-p)
+                       (format "%s" (julia-snail-request-display-type display))))))
+    (cond
+     (text
+      (let* ((text (thread-last
+                     text
+                     julia-snail-srcbuf-ov--clean-string
+                     ansi-color-apply)))
+        (cond
+         (folded-p
+          (julia-snail-srcbuf-ov--propertize
+           (julia-snail-srcbuf-ov--fold-string text)))
+         ((julia-snail-srcbuf-ov--fold-boundary text)
+          (julia-snail-srcbuf-ov--propertize
+           ;; Newline added so that background extends across entire line
+           ;; of the last line in TEXT.
+           (concat (julia-snail-srcbuf-ov--expand-string text) "\n")
+           t))
+         (t
+          (julia-snail-srcbuf-ov--propertize
+           (julia-snail-srcbuf-ov--expand-string text))))))
+     (t
+      (with-slots (type value meta) display
+        (pcase type
+          (:image
+           (let* ((img-data (base64-decode-string value))
+                  (img-type (intern (plist-get meta :ext)))
+                  (img (cons 'image (list :type img-type :data img-data))))
+             (concat "\n" (propertize " " 'display img))))
+          (:latex
+           (let* ((path (org-latex-preview-create-images value))
+                  (img (cons 'image (list :type 'svg :file path))))
+             (concat "\n" (propertize " " 'display img))))))))))
 
 (defun julia-snail-srcbuf-ov--update (ov)
+  "Update overlay to reflect the state of the overlay data."
   (when-let* ((buf (overlay-buffer ov)) ; nil if buf dead
-              (eval-props (overlay-get ov 'julia-snail-eval)))
-    (cl-destructuring-bind (fold type req-data) eval-props
-      (when-let ((text (julia-snail-srcbuf-ov--req-data-string req-data type)))
-        (pcase fold
-          ('folded
-           (julia-snail-srcbuf-ov--fold-string text)
-           (setf (overlay-get ov 'after-string)
-                 (julia-snail-srcbuf-ov--propertize text)))
-          ('expanded
-           (when (julia-snail-srcbuf-ov--fold-boundary text)
-             (setf (overlay-get ov 'after-string)
-                   (julia-snail-srcbuf-ov--propertize
-                    ;; Newline added so that background extends across entire line
-                    ;; of the last line in TEXT.
-                    (concat (julia-snail-srcbuf-ov--expand-string text) "\n")
-                    t)))))))))
+              (state (overlay-get ov julia-snail-srcbuf-ov-property))
+              (options (julia-snail-request-data-options
+                        (julia-snail-srcbuf-ov-state-data state))))
+    (with-slots (data showing) state
+      (unless (julia-snail-srcbuf-ov-state-showing state)
+        (setf (julia-snail-srcbuf-ov-state-showing state) (car options)))
+      (setf (overlay-get ov 'after-string)
+            (julia-snail-srcbuf-ov--string state)))))
 
-(defun julia-snail-srcbuf-ov--expand (ov)
-  (when-let* ((eval-props (overlay-get ov 'julia-snail-eval)))
-    (cl-destructuring-bind (fold type req-data) eval-props
-      (when-let ((text (julia-snail-srcbuf-ov--req-data-string req-data type)))
-        (when (eq fold 'folded)
-          (setf (car (overlay-get ov 'julia-snail-eval)) 'expanded)
-          (when (julia-snail-srcbuf-ov--fold-boundary text)
-            (setf (overlay-get ov 'after-string)
-                  (julia-snail-srcbuf-ov--propertize
-                   ;; Newline added so that background extends across entire line
-                   ;; of the last line in TEXT.
-                   (concat (julia-snail-srcbuf-ov--expand-string text) "\n")
-                   t))))))))
-
-(defun julia-snail-srcbuf-ov--fold (ov)
-  (when-let* ((eval-props (overlay-get ov 'julia-snail-eval)))
-    (cl-destructuring-bind (fold type req-data) eval-props
-      (when-let ((text (julia-snail-srcbuf-ov--req-data-string req-data type)))
-        (when (eq fold 'expanded)
-          (setf (car (overlay-get ov 'julia-snail-eval)) 'folded)
-          (julia-snail-srcbuf-ov--fold-string text)
-          (setf (overlay-get ov 'after-string)
-                (julia-snail-srcbuf-ov--propertize text)))))))
+(defun julia-snail-srcbuf-ov--make (beg end req-data)
+  (let ((ov (make-overlay beg end nil t))
+        (state (make-julia-snail-srcbuf-ov-state :data req-data)))
+    (overlay-put ov 'evaporate t)
+    (overlay-put ov 'modification-hooks '(julia-snail-srcbuf-ov--delete))
+    (overlay-put ov 'insert-in-front-hooks '(julia-snail-srcbuf-ov--delete))
+    (overlay-put ov 'insert-behind-hooks '(julia-snail-srcbuf-ov--delete))
+    (overlay-put ov 'keymap julia-snail-srcbuf-overlay-keymap)
+    (overlay-put ov julia-snail-srcbuf-ov-property state)
+    (julia-snail-srcbuf-ov--update ov)
+    ov))
 
 (defun julia-snail-srcbuf-ov--nearest ()
   (let (nearest)
@@ -1794,36 +1874,85 @@ this uses overlays which cannot be copied over with (buffer-string)."
       (when (and (or (null nearest)
                      (and (> (overlay-start ov) (overlay-start nearest))
                           (< (overlay-end ov) (overlay-end nearest))))
-                 (overlay-get ov 'julia-snail-eval))
+                 (overlay-get ov julia-snail-srcbuf-ov-property))
         (setq nearest ov)))
     nearest))
+
+(defun julia-snail-srcbuf-ov--print-state (state)
+  "Print to the message buffer what data type is currently shown."
+  (pcase-let* (((cl-struct julia-snail-srcbuf-ov-state
+                           data showing folded-p) state)
+               (options (julia-snail-request-data-options data))
+               ((cl-struct julia-snail-request-data
+                           stream-buf displays result) data)
+               (n-displays (length displays))
+               (stream-empty-p (= 0 (buffer-size stream-buf)))
+               (face-emph 'minibuffer-prompt)
+               (face-muted 'shadow))
+    (if (null options)
+        (message "No results")
+      (message
+       "%s: %s"
+       (if folded-p "Folded" "Expanded")
+       (with-work-buffer
+         (dolist (type options)
+           (cond
+            ((eq type 'stream)
+             (insert
+              (propertize
+               "Stream"
+               'face (if (eq showing 'stream) face-emph face-muted))))
+            ((numberp type)
+             (insert
+              " "
+              (propertize
+               (format "Display %s" (1+ type))
+               'face (if (and (numberp showing)
+                              (= showing type)) face-emph face-muted))))
+            ((eq type 'result)
+             (insert
+              " "
+              (propertize
+               "Result"
+               'face (if (eq showing 'result) face-emph face-muted))))))
+         (buffer-string))))))
+
+(defun julia-snail-srcbuf-ov-refresh (ov)
+  "Update overlay to reflect the state of the overlay data."
+  (when-let* ((state (overlay-get ov julia-snail-srcbuf-ov-property)))
+    (julia-snail-srcbuf-ov--update ov)
+    (julia-snail-srcbuf-ov--print-state state)))
 
 (defun julia-snail-srcbuf-ov-toggle-folding ()
   "Expand or contract the display of evaluation results around `point'."
   (interactive)
   (when-let* ((ov (julia-snail-srcbuf-ov--nearest))
-              (props (overlay-get ov 'julia-snail-eval)))
+              (state (overlay-get ov julia-snail-srcbuf-ov-property)))
     (julia-snail--flash-region (overlay-start ov) (overlay-end ov))
-    (cl-destructuring-bind (fold _ _) props
-      (if (eq fold 'folded)
-          (julia-snail-srcbuf-ov--expand ov)
-        (julia-snail-srcbuf-ov--fold ov)))))
+    (with-slots (folded-p) state
+      (setf (julia-snail-srcbuf-ov-state-folded-p state)
+            (if folded-p nil t)))
+    (julia-snail-srcbuf-ov-refresh ov)))
 
-(defun julia-snail-srcbuf-ov-toggle-type ()
-  "Toggle between stream and result."
+(defun julia-snail-srcbuf-ov-toggle-showing ()
+  "Toggle between stream, displays, and returned result."
   (interactive)
   (when-let* ((ov (julia-snail-srcbuf-ov--nearest))
-              (props (overlay-get ov 'julia-snail-eval)))
-    (julia-snail--flash-region (overlay-start ov) (overlay-end ov))
-    (cl-destructuring-bind (_ type _) props
-      (setf (nth 1 (overlay-get ov 'julia-snail-eval))
-            (if (or (null type) (eq type 'stream))
-                (progn
-                  (message "Showing result")
-                  'result)
-              (message "Showing stream")
-              'stream))
-      (julia-snail-srcbuf-ov--update ov))))
+              (state (overlay-get ov julia-snail-srcbuf-ov-property))
+              (options (julia-snail-request-data-options
+                        (julia-snail-srcbuf-ov-state-data state))))
+    (let* ((showing (julia-snail-srcbuf-ov-state-showing state))
+           (idx (cl-position showing options))
+           (new-showing (cond
+                         ((= 1 (length options))
+                          (car options))
+                         ((= idx (1- (length options)))
+                          0)
+                         (t
+                          (1+ idx)))))
+      (setf (julia-snail-srcbuf-ov-state-showing state) new-showing)
+      (julia-snail-srcbuf-ov-refresh ov))
+    (julia-snail--flash-region (overlay-start ov) (overlay-end ov))))
 
 (defun julia-snail-srcbuf-ov-remove-all ()
   "Remove all evaluation result overlays in the buffer."
@@ -1851,7 +1980,9 @@ this uses overlays which cannot be copied over with (buffer-string)."
   (and julia-snail-srcbuf-overlays julia-snail-repl-buffer))
 
 
-;;;; Support for completion modes' auxiliary doc modes (company-quickhelp and corfu-doc)
+;;;; Completion modes' auxiliary doc modes
+
+;; company-quickhelp and corfu-doc
 
 (defun julia-snail--completions-doc-buffer (str)
   (let* ((module (julia-snail--module-at-point))
@@ -1881,7 +2012,7 @@ this uses overlays which cannot be copied over with (buffer-string)."
     (cl-concatenate 'list comp doc)))
 
 
-;;;; Eldoc implementation
+;;;; Eldoc
 
 (defun julia-snail-eldoc ()
   "Implementation for ElDoc."
@@ -1892,7 +2023,7 @@ this uses overlays which cannot be copied over with (buffer-string)."
   nil
 )
 
-;;;; Multimedia support
+;;;; Multimedia
 
 (defun julia-snail-multimedia-display (img &optional reqid)
   (let* ((repl-buf (get-buffer julia-snail-repl-buffer))
@@ -1960,7 +2091,50 @@ this uses overlays which cannot be copied over with (buffer-string)."
        :async nil))))
 
 
-;;;; Extension support
+;;;; Formatter
+
+(defun julia-snail--format-text (txt)
+  (julia-snail--send-to-server
+    '("JuliaSnail" "Formatter")
+    (let* ((ubs (string-as-unibyte txt))
+           (estr (base64-encode-string ubs))
+           (pathstr (base64-encode-string (buffer-file-name))))
+      (format "format_data(\"%s\", \"%s\")" estr  pathstr))
+    :async nil))
+
+(defun julia-snail-format-region (begin end)
+  "Format region delimited by BEGIN and END using JuliaFormatter.jl.
+The code in the region must be syntactically valid Julia, otherwise no formatting will take place."
+  (interactive "r")
+  (let* ((text-to-be-formatted (buffer-substring-no-properties begin end))
+         (ftext (julia-snail--format-text text-to-be-formatted)))
+    (if (eq :nothing ftext)
+        (message "Parsing error, formatting failed")
+      (delete-region begin end)
+      (insert ftext))))
+
+(defun julia-snail-format-buffer ()
+  "Format buffer using JuliaFormatter.jl.
+The buffer must be syntactically valid Julia, otherwise no formatting will take place.
+Point placement after reformatting is sketchy, since the code might have changed quite a bit."
+  (interactive)
+  (let* ((old-point (point)))
+    (julia-snail-format-region (point-min) (point-max))
+    (goto-char old-point)))
+
+(defvar julia-snail-formatter-mode-map
+  (let ((map (make-sparse-keymap)))
+    (define-key map (kbd "C-c j f r") #'julia-snail-format-region)
+    (define-key map (kbd "C-c j f b") #'julia-snail-format-buffer)
+    map))
+
+(define-minor-mode julia-snail-formatter-mode
+  "Julia Snail JuliaFormatter.jl integration."
+  :init-value nil
+  :lighter ""
+  :keymap julia-snail-formatter-mode-map)
+
+;;;; Extensions
 
 (defun julia-snail--extension-symbol (extname)
   (intern (format "julia-snail/%s" extname)))

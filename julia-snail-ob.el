@@ -458,11 +458,27 @@ nothing and return nil."
      (if (string-empty-p text) ":\n"
        (replace-regexp-in-string "^" ": " text)))))
 
-(defun julia-snail-ob--format-result (type value)
-  (if-let* ((orgval (pcase type
-                      ('image (format "[[file:%s]]" value)))))
-      (cons orgval t)
-    (cons value nil)))
+(defun julia-snail-ob--display-image-filepath (request display)
+  (with-slots (counter meta) display
+    (expand-file-name
+     (format "%s_%s.%s"
+             (julia-snail-request-id request)
+             counter
+             (plist-get meta :ext))
+     julia-snail-ob-resource-directory)))
+
+(defun julia-snail-ob--format-display (request display)
+  (with-slots (type value) display
+    (if-let* ((orgval (pcase type
+                        (:latex
+                         value)
+                        (:image
+                         (format
+                          "[[file:%s]]"
+                          (julia-snail-ob--display-image-filepath
+                           request display))))))
+        (cons orgval t)
+      (cons value nil))))
 
 (defun julia-snail-ob--insert (type value)
   (pcase-let ((`(,result . ,org-p) (julia-snail-ob--format-result type value))
@@ -513,7 +529,7 @@ nothing and return nil."
 (defun julia-snail-ob--place-stream (request)
   "Places the contents of REQUEST's stream buffer in the results."
   (when-let* ((data (julia-snail-request-data request))
-              (stream-buf (julia-snail--request-data-stream-buf data))
+              (stream-buf (julia-snail-request-data-stream-buf data))
               (stream-str (with-current-buffer stream-buf
                             (buffer-string))))
     (julia-snail-ob-with-point-at request
@@ -544,44 +560,65 @@ nothing and return nil."
 (defun julia-snail-ob-place-results (&optional req)
   "Replace the results with the results stored in REQ's data."
   (when-let* ((req (or req (julia-snail-ob-request-at-point)))
-              (data (julia-snail-request-data req)))
+              (data (julia-snail-request-data req))
+              (options (julia-snail-request-data-options data)))
     (with-slots (result stream-buf displays) data
       (julia-snail-ob-with-point-at req
         (org-babel-remove-result)
         (julia-snail-ob--goto-result)
-        (let ((beg (point))
-              (content
-               (with-work-buffer
-                 (when-let* ((stream-str (with-current-buffer stream-buf
-                                           (buffer-string))))
-                   (unless (string-empty-p stream-str)
-                     (insert stream-str)))
-                 (dolist (d displays)
-                   (unless (bolp) (insert "\n"))
-                   (insert (car (julia-snail-ob--format-result (car d) (cdr d)))))
-                 (when result
-                   (unless (bolp) (insert "\n"))
-                   (insert (format "%s" result)))
-                 (buffer-string))))
-          (if displays
+        (let* ((beg (point))
+               (dir default-directory)
+               (contains-org-p nil)
+               (content
+                (with-work-buffer
+                  (dolist (option options)
+                    (cond
+                     ((eq option 'stream)
+                      (insert 
+                       (with-current-buffer stream-buf
+                         (buffer-string))))
+                     ((numberp option)
+                      (unless (bolp) (insert "\n"))
+                      (pcase-let* ((display (nth option displays))
+                                   (default-directory dir)
+                                   (`(,res . ,org-p)
+                                    (julia-snail-ob--format-display req display)))
+                        (setq contains-org-p (or contains-org-p org-p))
+                        (insert res)))
+                     ((eq option 'result)
+                      (unless (bolp) (insert "\n"))
+                      (insert (format "%s" result)))))
+                  (buffer-string))))
+          (if contains-org-p
               (insert ":RESULTS:\n" content "\n:END:\n")
             (insert (julia-snail-ob--format-fixed-width content) "\n"))
           ;; TODO Copy code this code to julia snail
           ;; The jupyter variant doesnt remove the escape codes so that the
           ;; colors are rendered when opening the file again.
           (jupyter-ansi-color-apply-on-region beg (point))
-          (org-link-preview nil beg (point))
-          )))))
+          (org-link-preview nil beg (point)))))))
 
 ;; From `jupyter-org-request-at-point'
-(defun julia-snail-ob-request-at-point ()
-  (interactive)
+(defun julia-snail-ob--request-at-point ()
   (when-let* ((context (org-element-context))
               (babel-p (memq (org-element-type context)
                              '(src-block babel-call
                                          inline-babel-call inline-src-block)))
               (pos (julia-snail-ob-element-begin-after-affiliated context))
               (req (get-text-property pos 'julia-snail-request)))
+    (cons req pos)))
+
+(defun julia-snail-ob-cleanup-request (request)
+  "Remove text property holding request object."
+  (julia-snail-ob-with-point-at request
+    (when-let* ((req-pos (julia-snail-ob--request-at-point))
+                (pos (cdr req-pos)))
+      (put-text-property pos (1+ pos) 'julia-snail-request nil))))
+
+(defun julia-snail-ob-request-at-point ()
+  (interactive)
+  (when-let* ((req-pos (julia-snail-ob--request-at-point))
+              (req (car req-pos)))
     (when (called-interactively-p 'interactive)
       (pp-eval-expression req))
     req))
@@ -700,24 +737,28 @@ Unless an output file is explicitly specified with the header arg
   (julia-snail-ob--remove-placeholder request)
   (when result
     ;; (julia-snail-ob--place-result request 'raw (format "%s" result))
-    (julia-snail-ob-place-results request)
-    ))
+    (julia-snail-ob-place-results request))
+  (julia-snail-ob-cleanup-request request))
 
 (defun julia-snail-ob-stream-callback (request type)
   (julia-snail-ob--remove-placeholder request)
   ;; (julia-snail-ob--place-stream request)
-  (julia-snail-ob-place-results request)
-  )
+  (julia-snail-ob-place-results request))
 
-(defun julia-snail-ob-display-callback (request type value)
+(defun julia-snail-ob-display-callback (request display)
+  (with-slots (type value) display
+    (pcase type
+      (:image
+       (with-temp-file (julia-snail-ob--display-image-filepath request display)
+         (insert (base64-decode-string value))))))
   (julia-snail-ob--remove-placeholder request)
   ;; (julia-snail-ob--place-result request type value)
-  (julia-snail-ob-place-results request)
-  )
+  (julia-snail-ob-place-results request))
 
 (defun julia-snail-ob-failure-callback (request)
   (when-let ((tmpfile (julia-snail-request-tmpfile request)))
-    (and (file-exists-p tmpfile) (delete-file tmpfile))))
+    (and (file-exists-p tmpfile) (delete-file tmpfile)))
+  (julia-snail-ob-cleanup-request request))
 
 (defun julia-snail-ob--maybe-make-raw (params)
   "Conditionally change the result type to \"raw\" if the \"latexify\"

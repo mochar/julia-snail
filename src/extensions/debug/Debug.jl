@@ -15,11 +15,14 @@ module Debug
 
 export @enter, @run
 
-Main.JuliaSnail.@with_pkg_env (@__DIR__) begin
-    import DebugAdapter
-    import Sockets
-    import Logging
-end
+import DebugAdapter
+import Sockets
+import Logging
+# Main.JuliaSnail.@with_pkg_env (@__DIR__) begin
+#     import DebugAdapter
+#     import Sockets
+#     import Logging
+# end
 
 port = 12124
 conn = missing
