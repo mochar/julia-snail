@@ -561,14 +561,14 @@ nothing and return nil."
   "Replace the results with the results stored in REQ's data."
   (when-let* ((req (or req (julia-snail-ob-request-at-point)))
               (data (julia-snail-request-data req))
-              (options (julia-snail-request-data-options data)))
-    (with-slots (result stream-buf displays) data
+              (options (julia-snail-request-data-options data 'include-error)))
+    (with-slots (result stream-buf displays error-message error-stack) data
       (julia-snail-ob-with-point-at req
         (org-babel-remove-result)
         (julia-snail-ob--goto-result)
         (let* ((beg (point))
                (dir default-directory)
-               (contains-org-p nil)
+               (drawer-p nil)
                (content
                 (with-work-buffer
                   (dolist (option options)
@@ -583,14 +583,24 @@ nothing and return nil."
                                    (default-directory dir)
                                    (`(,res . ,org-p)
                                     (julia-snail-ob--format-display req display)))
-                        (setq contains-org-p (or contains-org-p org-p))
+                        (setq drawer-p (or drawer-p org-p))
                         (insert res)))
                      ((eq option 'result)
                       (unless (bolp) (insert "\n"))
-                      (insert (format "%s" result)))))
+                      (insert (format "%s" result)))
+                     ((eq option 'error)
+                      (cond
+                       (error-stack
+                        (setq drawer-p t)
+                        (insert error-stack))
+                       (error-message
+                        (insert error-message))))))
                   (buffer-string))))
-          (if contains-org-p
-              (insert ":RESULTS:\n" content "\n:END:\n")
+          (if drawer-p
+              (progn
+                (insert ":RESULTS:\n" content)
+                (unless (bolp) (insert "\n"))
+                (insert":END:\n"))
             (insert (julia-snail-ob--format-fixed-width content) "\n"))
           ;; TODO Copy code this code to julia snail
           ;; The jupyter variant doesnt remove the escape codes so that the
@@ -718,7 +728,8 @@ Unless an output file is explicitly specified with the header arg
            body
            :repl-buf (concat "*" session "*")
            :async t
-           :display-error-buffer-on-failure? t
+           :queue t
+           :display-error-buffer-on-failure? nil
            :babel-props (list :params params :output-file output-file)
            :marker (copy-marker org-babel-current-src-block-location)
            :callback-success #'julia-snail-ob-success-callback
@@ -755,10 +766,11 @@ Unless an output file is explicitly specified with the header arg
   ;; (julia-snail-ob--place-result request type value)
   (julia-snail-ob-place-results request))
 
-(defun julia-snail-ob-failure-callback (request)
-  (julia-snail-ob--remove-placeholder request)
+(defun julia-snail-ob-failure-callback (request msg stack)
   (when-let ((tmpfile (julia-snail-request-tmpfile request)))
     (and (file-exists-p tmpfile) (delete-file tmpfile)))
+  (julia-snail-ob--remove-placeholder request)
+  (julia-snail-ob-place-results request)
   (julia-snail-ob-cleanup-request request))
 
 (defun julia-snail-ob--maybe-make-raw (params)

@@ -313,6 +313,8 @@ nil means disable Snail-specific imenu integration (fall back on julia-mode impl
   stream-buf
   result
   displays
+  error-message
+  error-stack
   finalizer)
 
 (cl-defstruct julia-snail-request
@@ -320,8 +322,8 @@ nil means disable Snail-specific imenu integration (fall back on julia-mode impl
   id
   repl-buf
   marker
-  (callback-success (lambda (&optional _data) (message "Snail command succeeded")))
-  (callback-failure (lambda () (message "Snail command failed")))
+  (callback-success (lambda (&rest _) (message "Snail command succeeded")))
+  (callback-failure (lambda (&rest _) (message "Snail command failed")))
   callback-stream
   callback-display
   (display-error-buffer-on-failure? t)
@@ -413,16 +415,17 @@ Uses function `compilation-shell-minor-mode'.")
    ((julia-snail-request-data-p request-or-data)
     request-or-data)))
   
-(defun julia-snail-request-data-options (request-or-data)
+(defun julia-snail-request-data-options (request-or-data &optional include-error)
   (pcase-let* ((data (julia-snail-request-data-resolve request-or-data))
                ((cl-struct julia-snail-request-data
-                           displays result stream-buf) data)
+                           displays result stream-buf error-message error-stack) data)
                (n-displays (length displays))
                (stream-empty-p (= 0 (buffer-size stream-buf))))
     (append
      (unless stream-empty-p '(stream))
      (number-sequence 0 (1- n-displays))
-     (when result '(result)))))
+     (when result '(result))
+     (when (and include-error (or error-message error-stack)) '(error)))))
 
 (defun julia-snail-request-data-empty-p (request-or-data)
   (null (julia-snail-request-data-options request-or-data)))
@@ -1174,12 +1177,11 @@ nil, wait for the result and return it."
                      (with-current-buffer (marker-buffer marker)
                        (funcall callback-success req result))))
                  :callback-failure
-                 (lambda (req)
-                   (unless async
-                     (setq res :nothing))
+                 (lambda (req msg stack)
+                   (unless async (setq res :nothing))
                    (when (and callback-failure (marker-buffer marker))
                      (with-current-buffer (marker-buffer marker)
-                       (funcall callback-failure req))))))))
+                       (funcall callback-failure req msg stack))))))))
     (with-current-buffer process-buf
       (goto-char (point-max))
       (insert display-msg))
@@ -1207,7 +1209,7 @@ nil, wait for the result and return it."
                                "Snail command timed out"
                              (format "Snail error: %s" wait-result))))
             (when callback-failure
-              (funcall callback-failure))
+              (funcall callback-failure req "Snail command timed out" nil))
             (with-current-buffer (marker-buffer marker)
               (spinner-stop))
             (error error-msg)))))))
@@ -1320,25 +1322,23 @@ evaluated in the context of MODULE."
       (funcall callback-success request result)))
   (julia-snail--response-base reqid))
 
-(defun julia-snail--response-failure (reqid error-message error-stack)
-  "Snail failure response handler for REQID, display ERROR-MESSAGE and ERROR-STACK."
-  (if (not julia-snail-show-error-window)
-      (message error-message)
-    (let* ((request-info (gethash reqid julia-snail--requests))
-           (repl-buf (julia-snail-request-repl-buf request-info))
-           (process-buf (get-buffer (julia-snail--process-buffer-name repl-buf)))
-           (error-buffer (julia-snail--message-buffer
-                          repl-buf
-                          "error"
-                          ;; (format "%s\n\n%s" error-message (s-join "\n" error-stack))
-                          error-message
-                          ))
-           (callback-failure (julia-snail-request-callback-failure request-info)))
-      (when (julia-snail-request-display-error-buffer-on-failure? request-info)
-        (julia-snail--setup-compilation-mode error-buffer (gethash process-buf julia-snail--cache-proc-basedir))
-        (pop-to-buffer error-buffer))
-      (when callback-failure
-        (funcall callback-failure request-info))))
+(defun julia-snail--response-failure (reqid error-message &optional error-stack)
+  "Snail failure response handler for REQID with ERROR-MESSAGE and ERROR-STACK."
+  (let* ((request (gethash reqid julia-snail--requests))
+         (data (julia-snail-request-data request)))
+    (setf (julia-snail-request-data-error-message data) error-message
+          (julia-snail-request-data-error-stack data) error-stack)
+    (when (julia-snail-request-display-error-buffer-on-failure? request)
+      (let* ((repl-buf (julia-snail-request-repl-buf request))
+             (process-buf (get-buffer (julia-snail--process-buffer-name repl-buf)))
+             (error-buffer (julia-snail--message-buffer
+                            repl-buf "error" error-stack)))
+        (julia-snail--setup-compilation-mode
+         error-buffer
+         (gethash process-buf julia-snail--cache-proc-basedir))
+        (pop-to-buffer error-buffer)))
+    (when-let* ((callback (julia-snail-request-callback-failure request)))
+      (funcall callback request error-message error-stack)))
   (julia-snail--response-base reqid))
 
 (defun julia-snail--response-interrupt (reqid)

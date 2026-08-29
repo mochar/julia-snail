@@ -436,6 +436,24 @@ function split_name(name::String, ns::Module=Main)
     return split_name(string(components[2]), getfield(ns, Symbol(components[1])))
 end
 
+"""
+Return first line of an error and a colored stacktrace.
+"""
+function format_error(err)
+    # Get first line of error as a summary
+    err_msg = split(sprint(showerror, err), "\n", limit=2)[1]
+
+    # Full stacktrace in color
+    exc_stack = current_exceptions()
+    stack_str = sprint(exc_stack; context=:color => true) do io, stack
+        # Base.invokelatest in case a library has defined new error
+        # formats
+        Base.invokelatest(Base.display_error, io, stack)
+    end
+
+    err_msg, stack_str
+end
+
 
 ### Introspection
 
@@ -1072,9 +1090,7 @@ function interrupt(reqid)
     # Check queued requests
     return lock(request_queue_lock) do
         idx = findfirst(req -> req.payload.reqid == reqid, request_queue)
-        if idx === nothing
-            return [:list, false]
-        end
+        idx === nothing && return [:list, false]
         
         req = popat!(request_queue, idx)
         try
@@ -1166,8 +1182,7 @@ function server_loop()
                 resp = elexpr([
                     Symbol("julia-snail--response-failure"),
                     payload.reqid,
-                    sprint(showerror, err),
-                    tuple(string.(stacktrace(catch_backtrace()))...)
+                    format_error(err)...
                 ])
                 println(client, resp)
                 if get(payload, :queue, false) === true
@@ -1291,16 +1306,10 @@ function process_request(client::TCPSocket, payload::NamedTuple, code::Expr)::Bo
             println(client, resp)
         else
             try
-                exc_stack = current_exceptions()
-                err_str = sprint(exc_stack; context=:color => true) do io, stack
-                    Base.invokelatest(Base.display_error, io, stack)
-                end
-                        
                 resp = elexpr([
                     Symbol("julia-snail--response-failure"),
                     reqid,
-                    err_str,
-                    tuple(string.(stacktrace(catch_backtrace()))...)
+                    format_error(err)...
                 ])
                 println(client, resp)
             catch err2
