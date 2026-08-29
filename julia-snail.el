@@ -1954,9 +1954,9 @@ What consitutes the first part is determined using `julia-snail-srcbuf-ov--fold-
                          ((= 1 (length options))
                           (car options))
                          ((= idx (1- (length options)))
-                          0)
+                          (car options))
                          (t
-                          (1+ idx)))))
+                          (nth (1+ idx) options)))))
       (setf (julia-snail-srcbuf-ov-state-showing state) new-showing)
       (julia-snail-srcbuf-ov-refresh ov))
     (julia-snail--flash-region (overlay-start ov) (overlay-end ov))))
