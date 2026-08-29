@@ -320,6 +320,8 @@ nil means disable Snail-specific imenu integration (fall back on julia-mode impl
 (cl-defstruct julia-snail-request
   "Snail protocol request tracking data structure."
   id
+  (state :pending) ; :pending (-> :queued) -> :busy -> :done
+  msg-data ; (msg . display-msg), only set when queued
   repl-buf
   marker
   (callback-success (lambda (&rest _) (message "Snail command succeeded")))
@@ -1080,6 +1082,22 @@ wait for the REPL prompt to return, otherwise return immediately."
        polling-interval
        polling-timeout))))
 
+(defun julia-snail--send-request (request)
+  "Send REQUEST to the snail server.
+This assumes that the msg-data slot contains (msg . display-msg), which
+after sending will be set to nil."
+  (with-slots (id repl-buf msg-data) request
+    (let* ((process-buf (julia-snail--process-buffer-name repl-buf))
+           (msg (car msg-data))
+           (display-msg (cdr msg-data)))
+      (with-current-buffer process-buf
+        (goto-char (point-max))
+        (insert display-msg))
+      (process-send-string process-buf msg)
+      (setf (julia-snail-request-msg-data request) nil ; dont need it anymore
+            (julia-snail-request-state request) :busy)
+      (puthash id request julia-snail--requests))))
+
 (cl-defun julia-snail--send-to-server
     (module
      str
@@ -1099,9 +1117,8 @@ wait for the REPL prompt to return, otherwise return immediately."
      callback-stream
      callback-display)
   "Send STR to Snail server, and evaluate it in the context of MODULE.
-Run callback-success and callback-failure as appropriate.
-When :async is t (default), return the request id. When :async is
-nil, wait for the result and return it."
+When :async is t (default), return the request id. When :async is nil, wait for
+the result and return it."
   (declare (indent defun))
   
   (unless repl-buf
@@ -1161,6 +1178,8 @@ nil, wait for the result and return it."
                                      data)))))
                 (make-julia-snail-request
                  :id reqid
+                 :state :pending
+                 :msg-data (cons msg display-msg)
                  :repl-buf repl-buf
                  :marker marker
                  :babel-props babel-props
@@ -1182,12 +1201,8 @@ nil, wait for the result and return it."
                    (when (and callback-failure (marker-buffer marker))
                      (with-current-buffer (marker-buffer marker)
                        (funcall callback-failure req msg stack))))))))
-    (with-current-buffer process-buf
-      (goto-char (point-max))
-      (insert display-msg))
-    (process-send-string process-buf msg)
-    (spinner-start 'progress-bar)
-    (puthash reqid req julia-snail--requests)
+
+    (julia-snail--send-request req)
 
     (if async
         req
@@ -1306,6 +1321,7 @@ evaluated in the context of MODULE."
 (defun julia-snail--response-base (reqid)
   "Snail response handler for REQID, base function."
   (when-let* ((request (gethash reqid julia-snail--requests)))
+    (setf (julia-snail-request-state request) :done)
     (when-let* ((tmpfile (julia-snail-request-tmpfile request)))
       (delete-file tmpfile))
     (with-current-buffer (marker-buffer (julia-snail-request-marker request))
