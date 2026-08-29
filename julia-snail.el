@@ -427,9 +427,6 @@ Uses function `compilation-shell-minor-mode'.")
 (defun julia-snail-request-data-empty-p (request-or-data)
   (null (julia-snail-request-data-options request-or-data)))
 
-
-
-
 ;;;; Supporting functions
 
 (defun julia-snail--copy-buffer-local-vars (from-buf)
@@ -1092,6 +1089,7 @@ wait for the REPL prompt to return, otherwise return immediately."
      (display-error-buffer-on-failure? t)
      babel-props
      (redirect-io t)
+     (queue t)
      srcbuf-ov
      callback-success
      callback-failure
@@ -1102,8 +1100,13 @@ Run callback-success and callback-failure as appropriate.
 When :async is t (default), return the request id. When :async is
 nil, wait for the result and return it."
   (declare (indent defun))
+  
   (unless repl-buf
     (user-error "No Julia REPL buffer %s found; run julia-snail" julia-snail-repl-buffer))
+
+  (when (and babel-props srcbuf-ov)
+    (user-error "At most one of `babel-props` and `srcbuf-ov` must be passed."))
+  
   (let* ((process-buf (get-buffer (julia-snail--process-buffer-name repl-buf)))
          (module-ns (julia-snail--construct-module-path module))
          (reqid (format "%04x%04x" (random (expt 16 4)) (random (expt 16 4))))
@@ -1122,19 +1125,21 @@ nil, wait for the result and return it."
                        (json-encode-string "Srcbuf()"))
                       (t "nothing")))
          (redirect-io-str (if redirect-io "true" "false"))
-         (msg (format "(ns = %s, reqid = \"%s\", code = %s, origin = %s, redirectio = %s)\n"
+         (queue-str (if queue "true" "false"))
+         (msg (format "(ns = %s, reqid = \"%s\", code = %s, origin = %s, redirectio = %s, queue = %s)\n"
                       module-ns
                       reqid
                       code-str
                       origin-str
                       redirect-io-str
-                      ))
-         (display-msg (format "(ns = %s, reqid = \"%s\", code = %s, origin = %s, redirectio = %s)\n"
+                      queue-str))
+         (display-msg (format "(ns = %s, reqid = \"%s\", code = %s, origin = %s, redirectio = %s, queue = %s)\n"
                               module-ns
                               reqid
                               display-code-str
                               origin-str
-                              redirect-io-str))
+                              redirect-io-str
+                              queue-str))
          (res-sentinel (gensym))
          (res res-sentinel)
          (req (let* ((stream-buf (generate-new-buffer
@@ -1214,6 +1219,7 @@ nil, wait for the result and return it."
      line-num
      &key
      (repl-buf (get-buffer julia-snail-repl-buffer))
+     queue
      callback-success
      callback-failure)
   "Send STR to server by first writing it to a tmpfile, calling
@@ -1246,6 +1252,7 @@ evaluated in the context of MODULE."
                      ;; (async t). This may or may not be worth fixing in the
                      ;; future.
                      :async t
+                     :queue queue
                      :callback-success callback-success
                      :callback-failure callback-failure)))
         ;; Update the request info to include tmpfile tracking

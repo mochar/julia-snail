@@ -756,6 +756,7 @@ Unless an output file is explicitly specified with the header arg
   (julia-snail-ob-place-results request))
 
 (defun julia-snail-ob-failure-callback (request)
+  (julia-snail-ob--remove-placeholder request)
   (when-let ((tmpfile (julia-snail-request-tmpfile request)))
     (and (file-exists-p tmpfile) (delete-file tmpfile)))
   (julia-snail-ob-cleanup-request request))

@@ -1002,20 +1002,92 @@ end
 
 ### Task handling
 
+"""
+Manage tasks and queued requests.
+
+Requests that are ready to be processed are turned into tasks and scheduled. If a request is to be queued, it is stored as a QueuedRequest struct in the request_queue.
+"""
 module Tasks
 
 import Printf
+using Sockets
+using ..JuliaSnail: elexpr
+
+struct QueuedRequest
+    client::Sockets.TCPSocket
+    payload::NamedTuple
+    code::Expr
+end
 
 active_tasks_lock = ReentrantLock()
 active_tasks = Dict{String, Task}()
 
+request_queue_lock = ReentrantLock()
+request_queue = QueuedRequest[]
+"Used to notify the queue worker that a new request is available."
+queue_cond = Base.Threads.Condition(request_queue_lock)
+
+"""Drain remaining queued requests and sends failure response."""
+function cancel_queue!(reason::String="Request canceled: prior queued request failed.")
+    lock(request_queue_lock) do
+        while !isempty(request_queue)
+            canceled = popfirst!(request_queue)
+            try
+                if isopen(canceled.client)
+                    resp = elexpr([
+                        Symbol("julia-snail--response-failure"),
+                        canceled.payload.reqid,
+                        reason,
+                        ()
+                    ])
+                    println(canceled.client, resp)
+                end
+            catch err
+                @error "Failed to notify client of canceled request" exception=err
+            end
+        end
+    end
+end
+
+"""Add a request to the queue."""
+function enqueue!(client::Sockets.TCPSocket, payload::NamedTuple, code::Expr)
+    lock(request_queue_lock) do
+        push!(request_queue, QueuedRequest(client, payload, code))
+        notify(queue_cond) # notify queue worker
+    end
+end
+
 function interrupt(reqid)
-    if haskey(active_tasks, reqid)
-        task = active_tasks[reqid]
-        schedule(task, InterruptException(), error=true)
-        return [:list, true]
-    else
-        return [:list, false]
+    # Check active running tasks
+    active = lock(active_tasks_lock) do
+        if haskey(active_tasks, reqid)
+            task = active_tasks[reqid]
+            schedule(task, InterruptException(), error=true)
+            return true
+        end
+        return false
+    end
+    active && return [:list true]
+
+    # Check queued requests
+    return lock(request_queue_lock) do
+        idx = findfirst(req -> req.payload.reqid == reqid, request_queue)
+        if idx === nothing
+            return [:list, false]
+        end
+        
+        req = popat!(request_queue, idx)
+        try
+            if isopen(req.client)
+                resp = elexpr([Symbol("julia-snail--response-interrupt"), reqid])
+                println(req.client, resp)
+            end
+        catch err
+            @error "Failed to send interrupt response for reqid $reqid" exception=err
+        finally
+            cancel_queue!("Request canceled: prior queued request was interrupted.")
+            return [:list, true]
+        end
     end
 end
 
@@ -1026,18 +1098,98 @@ end
 
 server::Union{Sockets.TCPServer, Nothing} = nothing
 server_task::Union{Task, Nothing} = nothing
+queue_worker_task::Union{Task, Nothing} = nothing
 server_stop_flag = Threads.Atomic{Bool}(false)
 clients = TCPSocket[]
 
-"""
-Start the Snail server.
+"""Loop run in a task that processes queued requests sequentially."""
+function queue_worker_loop()
+    while !server_stop_flag[]
+        local req::Union{Tasks.QueuedRequest, Nothing} = nothing
 
-The server starts a server socket and waits for connections. Connections listen
-for commands coming in from clients (i.e., Emacs). Commands are parsed,
-dispatched, and evaluated as needed.
-"""
+        # Await for the next request in the queue
+        lock(Tasks.request_queue_lock) do
+            while isempty(Tasks.request_queue) && !server_stop_flag[]
+                wait(Tasks.queue_cond)
+            end
+            if !server_stop_flag[] && !isempty(Tasks.request_queue)
+                req = popfirst!(Tasks.request_queue)
+            end
+        end
+
+        req === nothing && continue
+
+        if isopen(req.client)
+            req_task = schedule_request(req.client, req.payload, req.code)
+            success = try fetch(req_task) catch _ false end
+            if !success
+                Tasks.cancel_queue!("Request canceled: prior queued request failed.")
+            end
+        else
+            Tasks.cancel_queue!("Request canceled: client disconnected during queued execution.")
+        end
+    end
+end
+
+"""Listen for new clients and handle their requests."""
+function server_loop()
+    while !server_stop_flag[]
+        client = accept(server)
+        # @info "Client connected: $client"
+        push!(clients, client)
+            
+        @async while isopen(client) && !eof(client)
+            command = readline(client, keep=true)
+            # @info command
+
+            # First try to parse the payload itself. If it fails, we don't have
+            # access to the reqid, so we just run emacs' "warn" function.
+            payload = try
+                payload = eval(Meta.parse(command))
+                if haskey(payload, :origin) && payload.origin !== nothing
+                    origin = eval(Meta.parse(payload.origin))
+                    merge(payload, (origin=origin,))
+                else
+                    payload
+                end
+            catch err
+                @error "Error parsing request payload" err
+                resp = elexpr([:warn, "Julia snail: Error parsing request payload"])
+                println(client, resp)
+                continue
+            end
+
+            # Next try parsing the code as an Expr.
+            code = try
+                Meta.parse(payload.code)
+            catch err
+                resp = elexpr([
+                    Symbol("julia-snail--response-failure"),
+                    payload.reqid,
+                    sprint(showerror, err),
+                    tuple(string.(stacktrace(catch_backtrace()))...)
+                ])
+                println(client, resp)
+                if get(payload, :queue, false) === true
+                    Tasks.cancel_queue!("Request canceled: prior queued request failed to parse.")
+                end
+                continue
+            end
+                
+            # Schedule or queue
+            if get(payload, :queue, false) === true
+                Tasks.enqueue!(client, payload, code)
+            else
+                schedule_request(client, payload, code)
+            end
+        end
+    end
+    close(server)
+end
+
+"""Start the Snail server."""
 function start(port=10011; addr=ip"127.0.0.1")
-    global server, server_task, server_stop_flag
+    global server, server_task, server_stop_flag, queue_worker_task
 
     server_stop_flag[] = false
     if server === nothing || !isopen(server)
@@ -1074,70 +1226,29 @@ function start(port=10011; addr=ip"127.0.0.1")
         Base.eval(Base, :(stderr = $SnailProxyIO($stderr, :stderr)))
     end   
 
-    server_task = @async begin
-        while !server_stop_flag[]
-            client = accept(server)
-            # @info "Client connected: $client"
-            push!(clients, client)
-            
-            @async while isopen(client) && !eof(client)
-                command = readline(client, keep=true)
-                # @info command
+    # Make sure queue worker is running
+    if queue_worker_task === nothing || istaskdone(queue_worker_task)
+        queue_worker_task = @async queue_worker_loop()
+    end
 
-                # First try to parse the payload itself. If it fails, we don't
-                # have access to the reqid, so we just run emacs' "warn"
-                # function.
-                payload = try
-                    payload = eval(Meta.parse(command))
-                    if haskey(payload, :origin) && payload.origin !== nothing
-                        origin = eval(Meta.parse(payload.origin))
-                        merge(payload, (origin=origin,))
-                    else
-                        payload
-                    end
-                catch err
-                    @error "Error parsing request payload" err
-                    resp = elexpr([:warn, "Julia snail: Error parsing request payload"])
-                    println(client, resp)
-                    continue
-                end
-
-                # Next try parsing the code as an Expr.
-                code = try
-                    Meta.parse(payload.code)
-                catch err
-                    resp = elexpr([
-                        Symbol("julia-snail--response-failure"),
-                        payload.reqid,
-                        sprint(showerror, err),
-                        tuple(string.(stacktrace(catch_backtrace()))...)
-                    ])
-                    println(client, resp)
-                    continue
-                end
-                
-                # Process
-                req_task = @task process_request(client, payload, code)
-                
-                lock(Tasks.active_tasks_lock) do
-                    Tasks.active_tasks[payload.reqid] = req_task
-                end
-                schedule(req_task)
-            end
-        end # server while loop
-        close(server)
-    end # server task
+    # Run server
+    server_task = @async server_loop()
 end
 
-"""
-Shut down the Snail server.
-"""
+"""Shut down the Snail server."""
 function stop()
+    global server_stop_flag, server, clients
     server_stop_flag[] = true
 
     # Interrupt the blocking accept() call
     server !== nothing && isopen(server) && close(server)
     
+    # Cancel waiting requests and wake worker
+    Tasks.cancel_queue!("Server stopped.")
+    lock(Tasks.request_queue_lock) do
+        notify(Tasks.queue_cond)
+    end
+
     # Clean up any active client connections
     for _ in clients
         client = pop!(clients)
@@ -1145,10 +1256,18 @@ function stop()
     end
 end
 
-"""
-Process the payload of a single request.
-"""
-function process_request(client::TCPSocket, payload::NamedTuple, code::Expr)
+"""Schedules a request for processing and returns its task."""
+function schedule_request(client::TCPSocket, payload::NamedTuple, code::Expr)::Task
+    req_task = @task process_request(client, payload, code)
+    lock(Tasks.active_tasks_lock) do
+        Tasks.active_tasks[payload.reqid] = req_task
+    end
+    schedule(req_task)
+    req_task
+end
+
+"""Process the payload of a single request and returns whether it failed or not."""
+function process_request(client::TCPSocket, payload::NamedTuple, code::Expr)::Bool
     # @info "Payload" payload
     reqid = payload.reqid
     request = Request(
@@ -1160,10 +1279,12 @@ function process_request(client::TCPSocket, payload::NamedTuple, code::Expr)
         stderr=RequestStream(client=client, reqid=reqid, type=:stderr),
     )
                
+    success = false
     try
         result = eval_in_module(payload.ns, code, request)
         resp = elexpr([Symbol("julia-snail--response-success"), reqid, result])
         println(client, resp)
+        success = true
     catch err
         if isa(err, InterruptException)
             resp = elexpr([Symbol("julia-snail--response-interrupt"), reqid])
@@ -1192,6 +1313,7 @@ function process_request(client::TCPSocket, payload::NamedTuple, code::Expr)
             delete!(Tasks.active_tasks, reqid)
         end
     end
+    return success
 end
 
 ### Tail
