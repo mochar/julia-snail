@@ -1250,7 +1250,7 @@ function stop()
     end
 
     # Clean up any active client connections
-    for _ in clients
+    while !isempty(clients)
         client = pop!(clients)
         isopen(client) && close(client)
     end
