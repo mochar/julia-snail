@@ -1941,15 +1941,12 @@ this uses overlays which cannot be copied over with (buffer-string)."
     (when (overlay-get ov julia-snail-srcbuf-ov-property)
       (julia-snail-srcbuf-ov--delete ov))))
 
-(defun julia-snail-srcbuf-ov--propertize (text &optional newline)
+(defun julia-snail-srcbuf-ov--propertize-text (text)
   ;; Display properties can't be nested so use the one on TEXT if available
   (if (get-text-property 0 'display text)
       text
     (let ((display (concat
-                    ;; Add a space before a newline so that `point' stays on
-                    ;; the same line when moving to the beginning of the
-                    ;; overlay.
-                    (if newline " \n" " ")
+                    " "
                     (propertize
                      julia-snail-srcbuf-overlay-prefix
                      'face 'julia-snail-srcbuf-overlay)
@@ -1958,7 +1955,8 @@ this uses overlays which cannot be copied over with (buffer-string)."
                     ;; text
                     (propertize
                      text
-                     'face 'julia-snail-srcbuf-overlay)
+                     'face 'julia-snail-srcbuf-overlay
+                     )
                     )))
       ;; (add-face-text-property 0 (length display) 'underline t display)
       
@@ -1968,6 +1966,15 @@ this uses overlays which cannot be copied over with (buffer-string)."
       (put-text-property (1- (length display)) (length display) 'cursor t display)
       
       (propertize " " 'display display))))
+
+(defun julia-snail-srcbuf-ov--propertize-img (img)
+  (concat
+   " "
+   (propertize
+    julia-snail-srcbuf-overlay-prefix
+    'face 'julia-snail-srcbuf-overlay)
+   "\n"
+   (propertize " " 'display img)))
 
 (defun julia-snail-srcbuf-ov--fold-boundary (text)
   "Returns position of TEXT where remained should be invisible."
@@ -2011,26 +2018,31 @@ What consitutes the first part is determined using `julia-snail-srcbuf-ov--fold-
                             (eq (julia-snail-request-display-type display) :text))
                        (julia-snail-request-display-value display))
                       ((and display folded-p)
-                       (format "%s" (julia-snail-request-display-type display))))))
+                       (format "%s" (julia-snail-request-display-type display)))))
+               (text (when text
+                       (thread-last
+                         text
+                         julia-snail-srcbuf-ov--clean-string
+                         ansi-color-apply))))
     (cond
      (text
-      (let* ((text (thread-last
-                     text
-                     julia-snail-srcbuf-ov--clean-string
-                     ansi-color-apply)))
-        (cond
-         (folded-p
-          (julia-snail-srcbuf-ov--propertize
-           (julia-snail-srcbuf-ov--fold-string text)))
-         ((julia-snail-srcbuf-ov--fold-boundary text)
-          (julia-snail-srcbuf-ov--propertize
-           ;; Newline added so that background extends across entire line
-           ;; of the last line in TEXT.
-           (concat (julia-snail-srcbuf-ov--expand-string text) "\n")
-           t))
-         (t
-          (julia-snail-srcbuf-ov--propertize
-           (julia-snail-srcbuf-ov--expand-string text))))))
+      (cond
+       (folded-p
+        (julia-snail-srcbuf-ov--propertize-text
+         (julia-snail-srcbuf-ov--fold-string text)))
+       ((julia-snail-srcbuf-ov--fold-boundary text)
+        (julia-snail-srcbuf-ov--propertize-text
+         (concat
+          ;; Add a space before a newline so that `point' stays on the same
+          ;; line when moving to the beginning of the overlay.
+          " \n"
+          (julia-snail-srcbuf-ov--expand-string text)
+          ;; Newline added so that background extends across entire line
+          ;; of the last line in TEXT.
+          "\n")))
+       (t
+        (julia-snail-srcbuf-ov--propertize-text
+         (julia-snail-srcbuf-ov--expand-string text)))))
      (t
       (with-slots (type value meta) display
         (pcase type
@@ -2038,11 +2050,11 @@ What consitutes the first part is determined using `julia-snail-srcbuf-ov--fold-
            (let* ((img-data (base64-decode-string value))
                   (img-type (intern (plist-get meta :ext)))
                   (img (cons 'image (list :type img-type :data img-data))))
-             (concat "\n" (propertize " " 'display img))))
+             (julia-snail-srcbuf-ov--propertize-img img)))
           (:latex
            (let* ((path (org-latex-preview-create-images value))
                   (img (cons 'image (list :type 'svg :file path))))
-             (concat "\n" (propertize " " 'display img))))))))))
+             (julia-snail-srcbuf-ov--propertize-img img)))))))))
 
 (defun julia-snail-srcbuf-ov--update (ov)
   "Update overlay to reflect the state of the overlay data."
