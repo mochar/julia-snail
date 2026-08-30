@@ -625,6 +625,12 @@ nothing and return nil."
                 (pos (cdr req-pos)))
       (put-text-property pos (1+ pos) 'julia-snail-request nil))))
 
+(defun julia-snail-ob-cleanup-file ()
+  (org-babel-map-src-blocks nil
+    (when-let* ((req-pos (julia-snail-ob--request-at-point))
+                (pos (cdr req-pos)))
+      (put-text-property pos (1+ pos) 'julia-snail-request nil))))
+
 (defun julia-snail-ob-request-at-point ()
   (interactive)
   (when-let* ((req-pos (julia-snail-ob--request-at-point))
@@ -819,6 +825,12 @@ BLOCK is the content of the src block
 PARAMS are the parameter passed to the block"
   (when (member "replace" (assq :result-params params))
     (julia-snail-ob-cleanup-file-links))
+  (when-let* ((loc org-babel-current-src-block-location)
+              (req (org-with-point-at loc
+                     (julia-snail-ob-request-at-point))))
+    (if (yes-or-no-p "Block already running request. Interrupt it?")
+        (julia-snail--interrupt-request (julia-snail-request-id req))
+      (user-error "Evaluation canceled")))
   (let* ((params (julia-snail-ob--maybe-make-raw params))
          (session (julia-snail-ob-get-session-name params))
          (module (julia-snail-ob-get-module-str params))

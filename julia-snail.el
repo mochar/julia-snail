@@ -486,25 +486,34 @@ Updates the neighbor slots of the effected requests."
   "Remove REQUEST and its right-neighbours from the queue, returns the latter."
   (pcase-let* ((`(,head . ,tail) julia-snail--queue-ends)
                (`(,left . ,right) (julia-snail-request-queue-neighbors request)))
+
+    ;; Remove REQUEST from left-neighbour
     (when left
       (setf (cdr (julia-snail-request-queue-neighbors left)) nil))
-    
+
+    ;; Update queue ends
     (cond
      ((eq request head)
       (setq julia-snail--queue-ends (cons nil nil)))
-     ((eq request tail)
-      (setf (cdr julia-snail--queue-ends) nil)))
+     ((eq left head)
+      (setf (cdr julia-snail--queue-ends) nil))
+     (left
+      (setf (cdr julia-snail--queue-ends) left))
+     (t
+      ;; Left is nil and REQUEST is not the queue head, which means the request
+      ;; was already removed from the queue.
+      ))
+
+    ;; Set neighbors of REQUEST to nil
+    (setf (julia-snail-request-queue-neighbors request) nil)
     
+    ;; Gather right-remainder reqs while setting their neighbors to nil
     (let ((remainder (list)))
       (named-let recur ((next right))
         (when next
           (push next remainder)
           (prog1 (recur (cdr (julia-snail-request-queue-neighbors next)))
             (setf (julia-snail-request-queue-neighbors next) nil))))
-      (setf (julia-snail-request-queue-neighbors request) nil)
-      (when-let* ((last (car (last remainder))))
-        (when (eq tail remainder)
-          (setf (cdr julia-snail--queue-end) left)))
       remainder)))
 
 (defun julia-snail--queue-elements ()
@@ -518,7 +527,8 @@ Updates the neighbor slots of the effected requests."
   
 (defun julia-snail--queue-contains-p (request)
   "Return non-nil if REQUEST in queue."
-  ; Alternatively check if car and cdr of queue-neighbors slot are both nil
+  ; Alternatively we could have checked if car and cdr of queue-neighbors slot
+  ; are both nil.
   (or (eq (julia-snail-request-state request) :queued)
       (eq request (car julia-snail--queue-ends))))
 ;;;; Supporting functions
@@ -1396,6 +1406,8 @@ request to Julia."
       (julia-snail--response-interrupt reqid)
       (message "Interrupted queued request (%s)" reqid))
      (t
+      ;; TODO We might want to run julia-snail--response-interrupt directly
+      ;; without waiting for server to call it
       (let* ((repl-buf (julia-snail-request-repl-buf req))
              (resp (julia-snail--send-to-server
                      '("JuliaSnail" "Tasks")
@@ -1512,11 +1524,12 @@ request to Julia."
 (defun julia-snail--response-interrupt (reqid)
   "Snail task interruption response handler for REQID."
   (let ((request (gethash reqid julia-snail--requests)))
-    (julia-snail--response-base reqid)
-    
     ;; Callback
     (when-let* ((callback (julia-snail-request-callback-interrupt request)))
       (funcall callback request))
+
+    ;; Base
+    (julia-snail--response-base reqid)
     
     ;; Flush remaining requests if in queue. We must do this at the end to
     ;; ensure callbacks are evaluated sequentially.
