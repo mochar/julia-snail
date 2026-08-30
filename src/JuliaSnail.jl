@@ -13,49 +13,6 @@
 
 module JuliaSnail
 
-### Pkg hack
-
-# XXX: External dependency hack. Snail's own dependencies need to be listed
-# first in LOAD_PATH during initial load, otherwise conflicting versions
-# installed in the Julia global environment cause conflicts. Especially
-# CSTParser, with its unstable API. However, Snail should not be listed first
-# the rest of the time.
-# macro with_pkg_env(dir, action)
-#     :(
-#         try
-#             insert!(LOAD_PATH, 1, $dir)
-#             $action
-#         catch err
-#             if isa(err, ArgumentError)
-#                 if isfile(joinpath($dir, "Project.toml"))
-#                     # force dependency installation
-#                     Main.Pkg.activate($dir)
-#                     Main.Pkg.instantiate()
-#                     Main.Pkg.precompile()
-#                     # activate what was the first entry before Snail was pushed to the head of LOAD_PATH
-#                     Main.Pkg.activate(LOAD_PATH[2])
-#                 end
-#             end
-#         finally
-#             # Remove Snail from the head of the LOAD_PATH and put it at the tail. At this
-#             # point, all of its own dependencies should be loaded and the user's
-#             # preferred project should be active.
-#             deleteat!(LOAD_PATH, 1)
-#             if isfile(joinpath($dir, "Project.toml"))
-#                 push!(LOAD_PATH, $dir)
-#             end
-#         end
-#     )
-# end
-
-# @with_pkg_env (@__DIR__) begin
-#     # list all external dependency imports here (from the appropriate Project.toml, either Snail's or an extension's):
-#     import CSTParser
-#     # check for dependency API compatibility
-#     !isdefined(CSTParser, :iscall) &&
-#     throw(ArgumentError("CSTParser API not compatible, must install Snail-specific version"))
-# end
-
 ### Imports / exports
 
 import Markdown
@@ -1002,21 +959,112 @@ end
 
 end
 
-### Extensions
+### REPL history
 
-module Extensions
+module REPLHistory
+
+import REPL
 
 """
-Load an extension located in the "extensions" directory. Note that the extension
-will load in the context of the JuliaSnail.Extensions module.
+Return the last `n` items from the REPL history.
+Adapted from https://github.com/carstenbauer/SaveREPL.jl.
 """
-function load(path)
-    f = Base.Filesystem.joinpath([@__DIR__, "extensions", path...]...)
-    include(f)
+function replhistory(n::Int)
+   h = reverse(readlines(REPL.find_hist_file()))
+   entries = String[]
+   i = 1
+   N = length(h)
+   c = 0
+   while i <= N && c < n
+      line = h[i]
+      cmdlines = String[]
+      while startswith(line, "\t")
+         push!(cmdlines, replace(line, "\t" => ""; count=1))
+         i += 1
+         line = h[i]
+      end
+      command = join(reverse(cmdlines), "\n")
+      contains(line, "# mode:") || warn("wrong order: expected mode")
+      mode = replace(chomp(line), "# mode: " => "")
+      i += 1
+      line = h[i]
+      contains(line, "# time: ") || warn("wrong order: expected time")
+      time = replace(chomp(line), "# time: " => "")
+      i += 1
+      contains(mode, "julia") || continue
+      #push!(entries, REPLEntry(time, mode, command))
+      push!(entries, command)
+      c += 1
+   end
+   return [:list; reverse(entries)]
 end
 
 end
 
+### Debugger
+
+# module Debug
+
+# export @enter, @run
+
+# import DebugAdapter
+# import Sockets
+# import Logging
+
+# port = 12124
+# conn = missing
+# session = missing
+# server = missing
+# ready = Channel{Bool}(1)
+
+# function start()
+#     global server = Sockets.listen(port)
+#     Threads.@spawn begin
+#         while true
+#             @debug "Listening on port $port"
+#             global conn = Sockets.accept(server)
+#             @debug "Accepted connection"
+#             global session = DebugAdapter.DebugSession(conn)
+#             # When using the attach request, the terminate request does not work.
+#             session.capabilities.supportsTerminateRequest = false
+#             @debug "Starting debug session"
+#             put!(ready, true)
+#             DebugAdapter.run(session)
+#         end
+#     end
+# end
+
+# function run(mod, code, filepath; stop_on_entry=false)
+#     if ismissing(server)
+#         start()
+#     end
+#     soe = ":json-false"
+#     if stop_on_entry
+#         soe = "t"
+#     end
+#     Main.JuliaSnail.send_to_client("""
+#   (dape `(:request "attach"
+#           host "localhost"
+#           port $port
+#           :type "julia"
+#           :stopOnEntry $soe))
+# """)
+#     # Wait for the session to be ready.
+#     take!(ready)
+#     DebugAdapter.debug_code(session, mod, code, filepath)
+# end
+
+# macro enter(command)
+#     Base.remove_linenums!(command)
+#     :(run(Main, $(string(command)), $(string(__source__.file)), stop_on_entry=true))
+# end
+
+# macro run(command)
+#     Base.remove_linenums!(command)
+#     :(run(Main, $(string(command)), $(string(__source__.file)), stop_on_entry=false))
+# end
+
+# end
 
 ### Task handling
 
