@@ -45,6 +45,7 @@
 (require 'thingatpt)
 (require 'xref)
 (require 'ansi-color)
+(require 'queue)
 
 ;; XXX: One of vterm, eat, or ghostel must be manually installed before Snail starts.
 ;; Picking one or the other involves tradeoffs best left to the user, and
@@ -140,6 +141,15 @@
                  (const :tag "vterm" :vterm)
                  (const :tag "ghostel" :ghostel)))
 ;;(make-variable-buffer-local 'julia-snail-terminal-type) ; XXX: Let's not make this a buffer-local switch. Too messy.
+
+(defcustom julia-snail-queue-client-side t
+  "Handle queued requests in Emacs Elisp rather than Julia.
+This is much less buggy and ensures requests are handled one after another, as
+directly sending requests to the Julia server does not guarentee they will be
+handled in that order."
+  :tag "Handle queued requests in Emacs, not Julia"
+  :group 'julia-snail
+  :type 'boolean)
 
 (defcustom julia-snail-show-error-window t
   "When t: show compilation errors in separate window. When nil: display errors in the minibuffer."
@@ -354,9 +364,10 @@ nil means disable Snail-specific imenu integration (fall back on julia-mode impl
 (defvar julia-snail-port-counter 10011
   "Counter for dynamically allocating Snail ports.")
 
-;; TODO: Maybe this should hash by proc+reqid rather than just reqid?
 (defvar julia-snail--requests
   (make-hash-table :test #'equal))
+
+(defvar julia-snail--queue (make-queue))
 
 (defvar julia-snail--proc-responses
   (make-hash-table :test #'equal))
@@ -1084,8 +1095,9 @@ wait for the REPL prompt to return, otherwise return immediately."
 
 (defun julia-snail--send-request (request)
   "Send REQUEST to the snail server.
-This assumes that the msg-data slot contains (msg . display-msg), which
-after sending will be set to nil."
+This assumes that the msg-data slot contains (msg . display-msg), which after
+sending will be set to nil. This also assumes REQUEST is already stored in
+`julia-snail--requests'."
   (with-slots (id repl-buf msg-data) request
     (let* ((process-buf (julia-snail--process-buffer-name repl-buf))
            (msg (car msg-data))
@@ -1095,8 +1107,7 @@ after sending will be set to nil."
         (insert display-msg))
       (process-send-string process-buf msg)
       (setf (julia-snail-request-msg-data request) nil ; dont need it anymore
-            (julia-snail-request-state request) :busy)
-      (puthash id request julia-snail--requests))))
+            (julia-snail-request-state request) :busy))))
 
 (cl-defun julia-snail--send-to-server
     (module
@@ -1145,7 +1156,10 @@ the result and return it."
                        (json-encode-string "Srcbuf()"))
                       (t "nothing")))
          (redirect-io-str (if redirect-io "true" "false"))
-         (queue-str (if queue "true" "false"))
+         ;; Only let julia do the queueing when not doing so client side
+         (queue-str (if (and queue (not julia-snail-queue-client-side))
+                        "true"
+                      "false"))
          (msg (format "(ns = %s, reqid = \"%s\", code = %s, origin = %s, redirectio = %s, queue = %s)\n"
                       module-ns
                       reqid
@@ -1178,7 +1192,7 @@ the result and return it."
                                      data)))))
                 (make-julia-snail-request
                  :id reqid
-                 :state :pending
+                 :state (if queue :queued :pending)
                  :msg-data (cons msg display-msg)
                  :repl-buf repl-buf
                  :marker marker
@@ -1202,10 +1216,22 @@ the result and return it."
                      (with-current-buffer (marker-buffer marker)
                        (funcall callback-failure req msg stack))))))))
 
-    (julia-snail--send-request req)
+    (puthash reqid req julia-snail--requests)
+
+    (if (and queue
+             julia-snail-queue-client-side
+             async ; TODO Handle queued request for synchronous execution
+             )
+        (progn
+          (let ((queue-empty-p (queue-empty julia-snail--queue)))
+            (queue-enqueue julia-snail--queue req)
+            (when queue-empty-p
+              (julia-snail--send-request req))))
+      (julia-snail--send-request req))
 
     (if async
         req
+
       ;; XXX: Non-async (i.e. synchronous) server requests need to poll the
       ;; response. This means they can either (1) succeed, (2) timeout, or (3)
       ;; error out. Because errors occur in the process filter function and
@@ -1213,7 +1239,11 @@ the result and return it."
       ;; processed with a non-local transfer of control (throw and catch).
       (let ((wait-result
              (catch 'julia-snail--server-filter-error
-               (julia-snail--wait-while (eq res-sentinel res) async-poll-interval async-poll-maximum))))
+               (julia-snail--wait-while
+                (eq res-sentinel res)
+                async-poll-interval
+                async-poll-maximum))))
+        (setf (julia-snail-request-state req) :done)
         ;; wait-result can be t if poll succeeded, nil if it timed out, and an
         ;; error if something blew up. Note that an explicit check for t is
         ;; necessary here because wait-result can be truthy but nevertheless an
@@ -1334,8 +1364,17 @@ evaluated in the context of MODULE."
          (data (julia-snail-request-data request)))
     (when (and data result)
       (setf (julia-snail-request-data-result data) result))
+
+    ;; Handle queue
+    (when (eq request (queue-first julia-snail--queue))
+      (queue-dequeue julia-snail--queue)
+      (when-let* ((next-request (queue-first julia-snail--queue)))
+        (julia-snail--send-request next-request)))
+
+    ;; Callback
     (when-let* ((callback-success (julia-snail-request-callback-success request)))
       (funcall callback-success request result)))
+  
   (julia-snail--response-base reqid))
 
 (defun julia-snail--response-failure (reqid error-message &optional error-stack)
@@ -1353,9 +1392,24 @@ evaluated in the context of MODULE."
          error-buffer
          (gethash process-buf julia-snail--cache-proc-basedir))
         (pop-to-buffer error-buffer)))
+
+    ;; Callback
     (when-let* ((callback (julia-snail-request-callback-failure request)))
-      (funcall callback request error-message error-stack)))
-  (julia-snail--response-base reqid))
+      (funcall callback request error-message error-stack))
+
+    ;; Base
+    (julia-snail--response-base reqid)
+    
+    ;; Flush queue if this is head. We must do this at the end to ensure
+    ;; callbacks are evaluated sequentially.
+    (when (eq request (queue-first julia-snail--queue))
+      (queue-dequeue julia-snail--queue)
+      (when-let* ((queued (queue-all julia-snail--queue)))
+        (queue-clear julia-snail--queue)
+        (dolist (queued-request queued)
+          (julia-snail--response-failure
+           (julia-snail-request-id queued-request)
+           "Request canceled: prior queued request failed."))))))
 
 (defun julia-snail--response-interrupt (reqid)
   "Snail task interruption response handler for REQID."
