@@ -507,6 +507,20 @@ Updates the neighbor slots of the effected requests."
           (setf (cdr julia-snail--queue-end) left)))
       remainder)))
 
+(defun julia-snail--queue-elements ()
+  "Return sorted list of requests based on their queue position."
+  (when-let* ((cur (car julia-snail--queue-ends))
+              (queue (list cur)))
+    (while-let ((next (cdr (julia-snail-request-queue-neighbors cur))))
+      (push next queue)
+      (setq cur next))
+    (nreverse queue)))
+  
+(defun julia-snail--queue-contains-p (request)
+  "Return non-nil if REQUEST in queue."
+  ; Alternatively check if car and cdr of queue-neighbors slot are both nil
+  (or (eq (julia-snail-request-state request) :queued)
+      (eq request (car julia-snail--queue-ends))))
 ;;;; Supporting functions
 
 (defun julia-snail--copy-buffer-local-vars (from-buf)
@@ -1370,6 +1384,29 @@ evaluated in the context of MODULE."
         (setf (julia-snail-request-tmpfile reqtr) tmpfile)
         (setf (julia-snail-request-tmpfile-local-remote reqtr) tmpfile-local-remote)
         req))))
+
+(defun julia-snail--interrupt-request (reqid)
+  "Interrupt request with id REQID.
+If queued request simply cancel, if already running send interrupt
+request to Julia."
+  (let ((req (gethash reqid julia-snail--requests)))
+    (unless req (error "Request with id `%s` not found" reqid))
+    (cond
+     ((eq :queued (julia-snail-request-state req))
+      (julia-snail--response-interrupt reqid)
+      (message "Interrupted queued request (%s)" reqid))
+     (t
+      (let* ((repl-buf (julia-snail-request-repl-buf req))
+             (resp (julia-snail--send-to-server
+                     '("JuliaSnail" "Tasks")
+                     (format "interrupt(\"%s\")" reqid)
+                     :repl-buf repl-buf
+                     :async nil))
+             (res (car resp)))
+        (if res
+            (message "Interrupt scheduled for request (%s)" reqid)
+          (message "Unknown reqid %s on the Julia side" reqid)
+          (remhash reqid julia-snail--requests)))))))
 
 (defun julia-snail--server-response-filter (proc str)
   "Snail process filter for PROC given input STR; used as argument to `set-process-filter'."
@@ -2307,6 +2344,63 @@ Point placement after reformatting is sketchy, since the code might have changed
         (require extsym extfile)))))
 
 
+;;;; Request interaction
+
+(defun julia-snail--completing-read-requests (&optional error-on-empty)
+  (if-let* ((requests (append
+                       (julia-snail--queue-elements)
+                       (seq-keep
+                        (lambda (req)
+                          (unless (julia-snail--queue-contains-p req) req))
+                        (hash-table-values julia-snail--requests)))))
+      (let* ((candidates (seq-map-indexed
+                          (lambda (req i)
+                            (with-slots (id state srcbuf-ov babel-props marker) req
+                              (cons
+                               (propertize
+                                (format
+                                 "%s%s %s %s"
+                                 (if (julia-snail--queue-contains-p req)
+                                     (format "#%s " (1+ i))
+                                   "")
+                                 id
+                                 (cond
+                                  (babel-props "[babel]")
+                                  (srcbuf-ov "[srcbuf]")
+                                  (t ""))
+                                 (buffer-name (marker-buffer marker))
+                                 )
+                                'request req)
+                               req)))
+                          requests))
+             (table (lambda (str pred action)
+                      (if (not (eq action 'metadata))
+                          (complete-with-action action candidates str pred)
+                        (cons
+                         'metadata
+                         `((category . julia-snail-request)
+                           (display-sort-function . ,#'identity))))))
+             (selected (completing-read "Request: " table nil t))
+             (req (map-elt candidates selected)))
+        req)
+    (when error-on-empty
+      (user-error "No requests currently running (that the Emacs side knows about)"))))
+
+(defun julia-snail-requests ()
+  "View running requests and apply an action on them."
+  (interactive)
+  (let* ((req (julia-snail--completing-read-requests t))
+         (action (read-char-from-minibuffer
+                  "Action: (i)nterrupt, (v)isit "
+                  '(?i ?v))))
+    (with-slots (id marker) req
+      (pcase action
+        (?i
+         (julia-snail--interrupt-request id))
+        (?v
+         (pop-to-buffer-same-window (marker-buffer marker))
+         (goto-char marker))))))
+
 ;;;; Commands
 
 ;;;###autoload
@@ -2580,34 +2674,8 @@ autocompletion aware of the available modules."
 (defun julia-snail-interrupt-task ()
   "Try to interrupt a Julia computation task which was started on the Emacs side."
   (interactive)
-  (let* ((running-reqids (hash-table-keys julia-snail--requests))
-         ;; TODO: Filter these reqids for valid ones (e.g. ones with valid REPL
-         ;; buffers?)
-         (reqid (cond ((= 0 (length running-reqids))
-                       (user-error "No Julia tasks currently running (that the Emacs side knows about)"))
-                      ((= 1 (length running-reqids))
-                       (car running-reqids))
-                      (t
-                       (completing-read
-                        "Select id of Julia request to interrupt"
-                        ;; TODO: This needs to include metadata and annotations
-                        ;; for what computational task each reqid corresponds to
-                        ;; (like a line number or the actual code).
-                        running-reqids))))
-         (req (gethash reqid julia-snail--requests)))
-    (if (eq :queued (julia-snail-request-state req))
-        (julia-snail--response-interrupt reqid)
-      (let* ((repl-buf (julia-snail-request-repl-buf req))
-             (resp (julia-snail--send-to-server
-                     '("JuliaSnail" "Tasks")
-                     (format "interrupt(\"%s\")" reqid)
-                     :repl-buf repl-buf
-                     :async nil))
-             (res (car resp)))
-        (if res
-            (message "Interrupt scheduled for Julia reqid %s" reqid)
-          (message "Unknown reqid %s on the Julia side" reqid)
-          (remhash reqid julia-snail--requests))))))
+  (let ((req (julia-snail--completing-read-requests t)))
+    (julia-snail--interrupt-request (julia-snail-request-id req))))
 
 ;;;; Keymaps
 
