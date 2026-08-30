@@ -734,6 +734,7 @@ Unless an output file is explicitly specified with the header arg
            :marker (copy-marker org-babel-current-src-block-location)
            :callback-success #'julia-snail-ob-success-callback
            :callback-failure #'julia-snail-ob-failure-callback
+           :callback-interrupt #'julia-snail-ob-interrupt-callback
            :callback-stream #'julia-snail-ob-stream-callback
            :callback-display #'julia-snail-ob-display-callback
            )))
@@ -771,6 +772,11 @@ Unless an output file is explicitly specified with the header arg
     (and (file-exists-p tmpfile) (delete-file tmpfile)))
   (julia-snail-ob--remove-placeholder request)
   (julia-snail-ob-place-results request)
+  (julia-snail-ob-cleanup-request request))
+
+(defun julia-snail-ob-interrupt-callback (request)
+  (julia-snail-ob-with-point-at request
+    (org-babel-remove-result))
   (julia-snail-ob-cleanup-request request))
 
 (defun julia-snail-ob--maybe-make-raw (params)
