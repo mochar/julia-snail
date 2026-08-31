@@ -906,7 +906,109 @@ returns \"/home/username/file.jl\"."
         (concat " " fn-res)
       fn-res)))
 
-;;;; Connection management
+;;;; Mode line
+
+;; A lot copied from bufferlo.
+;; This stores the mode line info in `mode-line-misc-info' rather than setting
+;; the 'lighter' of the minor mode. This makes it visible when `mode-line-modes'
+;; is removed from `mode-line-format' (which is what I have).
+
+(defvar julia-snail-mode-line)
+(defvar julia-snail--mode-line-spinner (spinner-create 'horizontal-breathing))
+(defvar julia-snail--mode-line-modes
+  '(julia-snail-mode julia-snail-repl-mode julia-snail-ob-mode))
+
+(defun julia-snail--mode-line-mode-p ()
+  (when (seq-find
+         (lambda (mode) (and (boundp mode) (symbol-value mode)))
+         julia-snail--mode-line-modes)
+    t))
+
+(defun julia-snail--mode-lighter (&optional extra)
+  (let ((snail-emoji (char-from-name "SNAIL")))
+    (if (and julia-snail-use-emoji-mode-lighter
+             snail-emoji
+             (char-displayable-p snail-emoji))
+        (format "%c%s" snail-emoji (if extra extra ""))
+      (format "Snail%s" (if extra extra "")))))
+
+(defun julia-snail-mode-line-format ()
+  "Julia Snail mode-line format to display active session state."
+  (when (julia-snail--mode-line-mode-p)
+    (format
+     "%s%s%s"
+     (julia-snail--mode-lighter)
+     (or (spinner-print julia-snail--mode-line-spinner) "  ")
+     "" ;; (propertize julia-snail-repl-buffer 'face 'shadow)
+     )))
+
+(defun julia-snail--reset-mode-line ()
+  "Remove the julia-snail mode line entry."
+  (dolist (mode julia-snail--mode-line-modes)
+    (setq mode-line-misc-info
+          (delq (assq mode mode-line-misc-info) mode-line-misc-info))))
+
+(defun julia-snail--set-mode-line ()
+  "Add the julia-snail mode line entry if it's not there already."
+  (dolist (mode julia-snail--mode-line-modes)
+    (unless (map-elt mode-line-misc-info mode)
+      (setq mode-line-misc-info
+            (cons (list mode julia-snail-mode-line)
+                  mode-line-misc-info)))))
+
+(defcustom julia-snail-mode-line '(:eval (julia-snail-mode-line-format))
+  "Julia-Snail mode line definition."
+  :type 'sexp
+  :set (lambda (variable value)
+         (julia-snail--reset-mode-line) ; do before we overwrite the value
+         (set-default variable value)
+         (julia-snail--set-mode-line))
+  :initialize #'custom-initialize-default
+  :risky t)
+
+
+;;;; Terminal emulators
+
+(defun julia-snail--terminal-send-string (str)
+  (cond
+   ;; Eat
+   ((eq 'eat-mode major-mode)
+    (eat-term-send-string eat-terminal str)
+    ;; TODO: Remove this call when https://codeberg.org/akib/emacs-eat/issues/100 is fixed.
+    (when (fboundp 'eat--process-input-queue)
+      (declare-function eat--process-input-queue "eat.el")
+      (eat--process-input-queue (current-buffer))))
+   ;; vterm
+   ((eq 'vterm-mode major-mode)
+    (vterm-send-string str))
+   ;; ghostel
+   ((eq 'ghostel-mode major-mode)
+    (ghostel-send-string str))
+   ;; error and debugging
+   (t
+    (error "function called out of context; (with-current-buffer repl-buf ...) required"))))
+
+(defun julia-snail--terminal-send-return ()
+  (cond
+   ;; Eat
+   ((eq 'eat-mode major-mode)
+    (eat-term-send-string eat-terminal "\n")
+    ;; TODO: Remove this call when https://codeberg.org/akib/emacs-eat/issues/100 is fixed.
+    (when (fboundp 'eat--process-input-queue)
+      (declare-function eat--process-input-queue "eat.el")
+      (eat--process-input-queue (current-buffer))))
+   ;; vterm
+   ((eq 'vterm-mode major-mode)
+    (vterm-send-return))
+   ;; ghostel
+   ((eq 'ghostel-mode major-mode)
+    (ghostel-send-key "return"))
+   ;; error and debugging
+   (t
+    (error "function called out of context; (with-current-buffer repl-buf ...) required"))))
+
+
+;;;; REPL interaction
 
 (defun julia-snail--clear-proc-caches (process-buf)
   "Clear connection-specific internal Snail xref, completion, and module caches."
@@ -1020,61 +1122,6 @@ returns \"/home/username/file.jl\"."
   "REPL buffer minor mode cleanup."
   (julia-snail--repl-cleanup))
 
-(defun julia-snail--enable ()
-  "Source buffer minor mode initializer."
-  ;; force .dir-locals.el to load
-  (hack-dir-local-variables-non-file-buffer)
-  ;; other minor mode initializations can go here
-  )
-
-(defun julia-snail--disable ()
-  "Source buffer minor mode cleanup."
-  )
-
-
-;;;; Terminal emulators
-
-(defun julia-snail--terminal-send-string (str)
-  (cond
-   ;; Eat
-   ((eq 'eat-mode major-mode)
-    (eat-term-send-string eat-terminal str)
-    ;; TODO: Remove this call when https://codeberg.org/akib/emacs-eat/issues/100 is fixed.
-    (when (fboundp 'eat--process-input-queue)
-      (declare-function eat--process-input-queue "eat.el")
-      (eat--process-input-queue (current-buffer))))
-   ;; vterm
-   ((eq 'vterm-mode major-mode)
-    (vterm-send-string str))
-   ;; ghostel
-   ((eq 'ghostel-mode major-mode)
-    (ghostel-send-string str))
-   ;; error and debugging
-   (t
-    (error "function called out of context; (with-current-buffer repl-buf ...) required"))))
-
-(defun julia-snail--terminal-send-return ()
-  (cond
-   ;; Eat
-   ((eq 'eat-mode major-mode)
-    (eat-term-send-string eat-terminal "\n")
-    ;; TODO: Remove this call when https://codeberg.org/akib/emacs-eat/issues/100 is fixed.
-    (when (fboundp 'eat--process-input-queue)
-      (declare-function eat--process-input-queue "eat.el")
-      (eat--process-input-queue (current-buffer))))
-   ;; vterm
-   ((eq 'vterm-mode major-mode)
-    (vterm-send-return))
-   ;; ghostel
-   ((eq 'ghostel-mode major-mode)
-    (ghostel-send-key "return"))
-   ;; error and debugging
-   (t
-    (error "function called out of context; (with-current-buffer repl-buf ...) required"))))
-
-
-;;;; REPL and Snail server interaction
-
 (defun julia-snail--looking-back-string (str)
   "Return t if the buffer contents preceding point matches `str'. The same
 as `looking-back', but for string matches instead of regular expression
@@ -1111,6 +1158,30 @@ wait for the REPL prompt to return, otherwise return immediately."
        polling-interval
        polling-timeout))))
 
+;;;###autoload
+(define-minor-mode julia-snail-repl-mode
+  "A minor mode for interactive Julia development.
+Should only be turned on in REPL buffers.
+
+The following keys are set:
+\\{julia-snail-repl-mode-map}"
+  :init-value nil
+  :lighter (:eval (julia-snail--mode-lighter))
+  :keymap julia-snail-repl-mode-map
+  (when (or (eq 'vterm-mode major-mode)
+            (eq 'eat-mode major-mode)
+            (eq 'ghostel-mode major-mode))
+    (julia-snail--reset-mode-line)
+    (if julia-snail-repl-mode
+        (progn
+          (julia-snail--repl-enable)
+          ;; Make sure mode line contains julia snail entry
+          (julia-snail--set-mode-line))
+      (julia-snail--repl-disable))))
+
+
+;;;; Server interaction
+
 (defun julia-snail--send-request (request)
   "Send REQUEST to the snail server.
 This assumes that the msg-data slot contains (msg . display-msg), which after
@@ -1125,7 +1196,8 @@ sending will be set to nil. This also assumes REQUEST is already stored in
         (insert display-msg))
       (process-send-string process-buf msg)
       (setf (julia-snail-request-msg-data request) nil ; dont need it anymore
-            (julia-snail-request-state request) :busy))))
+            (julia-snail-request-state request) :busy)
+      (spinner-start julia-snail--mode-line-spinner))))
 
 (cl-defun julia-snail--send-to-server
     (module
@@ -1400,7 +1472,9 @@ request to Julia."
       (delete-file tmpfile))
     (with-current-buffer (marker-buffer (julia-snail-request-marker request))
       (spinner-stop))
-    (remhash reqid julia-snail--requests)))
+    (remhash reqid julia-snail--requests)
+    (when (hash-table-empty-p julia-snail--requests)
+      (spinner-stop julia-snail--mode-line-spinner))))
 
 (defun julia-snail--response-success (reqid result)
   "Snail success response handler for REQID given RESULT."
@@ -2728,16 +2802,6 @@ autocompletion aware of the available modules."
 
 ;;;; Mode definitions
 
-;;;;; Source buffer
-
-(defun julia-snail--mode-lighter (&optional extra)
-  (let ((snail-emoji (char-from-name "SNAIL")))
-    (if (and julia-snail-use-emoji-mode-lighter
-             snail-emoji
-             (char-displayable-p snail-emoji))
-        (format " %c%s" snail-emoji (if extra extra ""))
-      (format " Snail%s" (if extra extra "")))))
-
 ;;;###autoload
 (define-minor-mode julia-snail-mode
   "A minor mode for interactive Julia development.
@@ -2748,10 +2812,11 @@ The following keys are set:
   :init-value nil
   :lighter (:eval (julia-snail--mode-lighter))
   :keymap julia-snail-mode-map
+  (julia-snail--reset-mode-line)
   (if julia-snail-mode
       ;; activate
       (progn
-        (julia-snail--enable)
+        ;; (hack-dir-local-variables-non-file-buffer) ; force .dir-locals.el to load
         (add-hook 'xref-backend-functions #'julia-snail-xref-backend nil t)
         (add-function :before-until (local 'eldoc-documentation-function) #'julia-snail-eldoc)
         (advice-add 'spinner-print :around #'julia-snail--spinner-print-around)
@@ -2762,7 +2827,9 @@ The following keys are set:
                      )
                  julia-snail-completions-doc-enable)
             (add-hook 'completion-at-point-functions #'julia-snail-completions-doc-capf nil t)
-          (add-hook 'completion-at-point-functions #'julia-snail-repl-completion-at-point nil t)))
+          (add-hook 'completion-at-point-functions #'julia-snail-repl-completion-at-point nil t))
+        ;; Make sure mode line contains julia snail entry
+        (julia-snail--set-mode-line))
     ;; deactivate
     (remove-hook 'completion-at-point-functions #'julia-snail-completions-doc-capf t)
     (remove-hook 'completion-at-point-functions #'julia-snail-repl-completion-at-point t)
@@ -2770,37 +2837,13 @@ The following keys are set:
     (setq julia-snail--imenu-fallback-index-function nil)
     (advice-remove 'spinner-print #'julia-snail--spinner-print-around)
     (remove-function (local 'eldoc-documentation-function) #'julia-snail-eldoc)
-    (remove-hook 'xref-backend-functions #'julia-snail-xref-backend t)
-    (julia-snail--disable)))
-
-;;;;; REPL buffer
-
-;;;###autoload
-(define-minor-mode julia-snail-repl-mode
-  "A minor mode for interactive Julia development.
-Should only be turned on in REPL buffers.
-
-The following keys are set:
-\\{julia-snail-repl-mode-map}"
-  :init-value nil
-  :lighter (:eval (julia-snail--mode-lighter))
-  :keymap julia-snail-repl-mode-map
-  (when (or (eq 'vterm-mode major-mode)
-            (eq 'eat-mode major-mode)
-            (eq 'ghostel-mode major-mode))
-    (if julia-snail-repl-mode
-        (julia-snail--repl-enable)
-      (julia-snail--repl-disable))))
-
-;;;;; Message buffer
+    (remove-hook 'xref-backend-functions #'julia-snail-xref-backend t)))
 
 (define-minor-mode julia-snail-message-buffer-mode
   "A minor mode for displaying messages returned from the Julia REPL."
   :init-value nil
   :lighter (:eval (julia-snail--mode-lighter " Message"))
   :keymap '(((kbd "q") . quit-window)))
-
-;;;;; Multimedia buffer
 
 (define-minor-mode julia-snail-multimedia-buffer-mode
   "A minor mode for displaying Julia multimedia output an Emacs buffer."
