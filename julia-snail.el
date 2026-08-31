@@ -1158,6 +1158,10 @@ wait for the REPL prompt to return, otherwise return immediately."
        polling-interval
        polling-timeout))))
 
+(defvar-keymap julia-snail-repl-mode-map
+  "C-c C-z" #'julia-snail-repl-go-back
+  "C-k" #'julia-snail-repl-terminal-kill-line)
+
 ;;;###autoload
 (define-minor-mode julia-snail-repl-mode
   "A minor mode for interactive Julia development.
@@ -2601,38 +2605,40 @@ This will occur in the context of the Main module, just as it would at the REPL.
       (julia-snail--send-to-server
         module
         (format "include(\"%s\"); Main.JuliaSnail.elexpr(true)" filename)
-        :callback-success (lambda (_request-info &optional _data)
-                            ;; julia-snail-repl-buffer must be rebound here from
-                            ;; jsrb-save, because the callback will run in a
-                            ;; different scope, in which the correct binding of
-                            ;; julia-snail-repl-buffer will have disappeared
-                            (let* ((julia-snail-repl-buffer jsrb-save)
-                                   (repl-buf (get-buffer julia-snail-repl-buffer)))
-                              ;; NB: At the moment, julia-snail--cst-includes
-                              ;; does not return :error. However, it might in
-                              ;; the future, and this code will then be useful.
-                              (if (eq :error includes)
-                                  (let ((error-buffer
-                                         (julia-snail--message-buffer
-                                          repl-buf
-                                          "error"
-                                          (concat filename
-                                                  " loaded in Julia, but the Snail parser failed.\n\n"
-                                                  "Please report this as a parser bug:\n\n"
-                                                  "https://github.com/gcv/julia-snail/issues\n\n"
-                                                  "Please try to narrow down the code which Snail fails to parse.\n"
-                                                  "The easiest way of doing this is to bisect the failing source file by\n"
-                                                  "commenting out successive halves.\n"
-                                                  "The more information about code which Snail cannot parse you include in the bug\n"
-                                                  "report, the easier it will be to fix."))))
-                                    (pop-to-buffer error-buffer))
-                                ;; successful load
-                                (julia-snail--module-merge-includes filename includes)
-                                (message "%s loaded: module %s"
-                                         filename
-                                         (julia-snail--construct-module-path module)))))))))
+        :callback-success
+        (lambda (_request-info &optional _data)
+          ;; julia-snail-repl-buffer must be rebound here from
+          ;; jsrb-save, because the callback will run in a
+          ;; different scope, in which the correct binding of
+          ;; julia-snail-repl-buffer will have disappeared
+          (let* ((julia-snail-repl-buffer jsrb-save)
+                 (repl-buf (get-buffer julia-snail-repl-buffer)))
+            ;; NB: At the moment, julia-snail--cst-includes
+            ;; does not return :error. However, it might in
+            ;; the future, and this code will then be useful.
+            (if (eq :error includes)
+                (let ((error-buffer
+                       (julia-snail--message-buffer
+                        repl-buf
+                        "error"
+                        (concat filename
+                                " loaded in Julia, but the Snail parser failed.\n\n"
+                                "Please report this as a parser bug:\n\n"
+                                "https://github.com/gcv/julia-snail/issues\n\n"
+                                "Please try to narrow down the code which Snail fails to parse.\n"
+                                "The easiest way of doing this is to bisect the failing source file by\n"
+                                "commenting out successive halves.\n"
+                                "The more information about code which Snail cannot parse you include in the bug\n"
+                                "report, the easier it will be to fix."))))
+                  (pop-to-buffer error-buffer))
+              ;; successful load
+              (julia-snail--module-merge-includes filename includes)
+              (message "%s loaded: module %s"
+                       filename
+                       (julia-snail--construct-module-path module)))))))))
 
-;; Trimmed down version of julia-snail-send-buffer-file which only analyzes the "include" statements without running the code
+;; Trimmed down version of julia-snail-send-buffer-file which only analyzes the
+;; "include" statements without running the code
 (defun julia-snail-analyze-includes ()
   "Analyze the current buffer's file for include statements"
   (interactive)
@@ -2665,8 +2671,9 @@ This will occur in the context of the Main module, just as it would at the REPL.
     (julia-snail--send-to-server
       :Main
       (format "Pkg.activate(\"%s\")" expanded-dir)
-      :callback-success (lambda (_request-info &optional _data)
-                          (message "Package activated: %s" expanded-dir)))))
+      :callback-success
+      (lambda (_request-info &optional _data)
+        (message "Package activated: %s" expanded-dir)))))
 
 (defun julia-snail-doc-lookup (identifier)
   "Look up Julia documentation for symbol at point (IDENTIFIER)."
@@ -2754,53 +2761,20 @@ autocompletion aware of the available modules."
   (let ((req (julia-snail--completing-read-requests t)))
     (julia-snail--interrupt-request (julia-snail-request-id req))))
 
-;;;; Keymaps
-
-(defvar julia-snail-mode-map
-  (let ((map (make-sparse-keymap)))
-    (define-key map (kbd "C-c C-z") #'julia-snail)
-    (define-key map (kbd "C-c C-a") #'julia-snail-package-activate)
-    (define-key map (kbd "C-c C-d") #'julia-snail-doc-lookup)
-    (define-key map (kbd "C-c C-w") #'julia-snail-copy-last-eval-result)
-    (define-key map (kbd "C-c C-c") #'julia-snail-send-top-level-form)
-    (define-key map (kbd "C-M-x") #'julia-snail-send-top-level-form)
-    (define-key map (kbd "C-c C-r") #'julia-snail-send-region)
-    (define-key map (kbd "C-c C-l") #'julia-snail-send-line)
-    (define-key map (kbd "C-c C-e") #'julia-snail-send-dwim)
-    (define-key map (kbd "C-c C-k") #'julia-snail-send-buffer-file)
-    (define-key map (kbd "C-c C-m u") #'julia-snail-update-module-cache)
-    map))
-
-(defvar julia-snail-repl-mode-map
-  (let ((map (make-sparse-keymap)))
-    (define-key map (kbd "C-c C-z") #'julia-snail-repl-go-back)
-    (define-key map (kbd "C-k") #'julia-snail-repl-terminal-kill-line)
-    map))
-
-
-;;;; Mode menu
-
-(easy-menu-define julia-snail-mode-menu julia-snail-mode-map
-  "Julia-Snail mode menu."
-  '("Snail"
-    ["Switch to REPL" julia-snail]
-    ["Activate package" julia-snail-package-activate]
-    ["Lookup documentation" julia-snail-doc-lookup]
-    ["Copy last inline result" julia-snail-copy-last-eval-result]
-    ["Update module cache" julia-snail-update-module-cache]
-    "---"
-    ["Evaluate line" julia-snail-send-line]
-    ["Evaluate top-level form" julia-snail-send-top-level-form]
-    ["Evaluate region" julia-snail-send-region :active (region-active-p)]
-    ["Evaluate file" julia-snail-send-buffer-file]))
-
-(easy-menu-define julia-snail-repl-mode-menu julia-snail-repl-mode-map
-  "Julia-Snail REPL mode menu."
-  '("Snail REPL"
-    ["Switch to source" julia-snail-repl-go-back]))
-
-
 ;;;; Mode definitions
+
+(defvar-keymap julia-snail-mode-map
+  "C-c C-z"   #'julia-snail
+  "C-c C-a"   #'julia-snail-package-activate
+  "C-c C-d"   #'julia-snail-doc-lookup
+  "C-c C-w"   #'julia-snail-copy-last-eval-result
+  "C-c C-c"   #'julia-snail-send-top-level-form
+  "C-M-x"     #'julia-snail-send-top-level-form
+  "C-c C-r"   #'julia-snail-send-region
+  "C-c C-l"   #'julia-snail-send-line
+  "C-c C-e"   #'julia-snail-send-dwim
+  "C-c C-k"   #'julia-snail-send-buffer-file
+  "C-c C-m u" #'julia-snail-update-module-cache)
 
 ;;;###autoload
 (define-minor-mode julia-snail-mode
@@ -2838,6 +2812,25 @@ The following keys are set:
     (advice-remove 'spinner-print #'julia-snail--spinner-print-around)
     (remove-function (local 'eldoc-documentation-function) #'julia-snail-eldoc)
     (remove-hook 'xref-backend-functions #'julia-snail-xref-backend t)))
+
+(easy-menu-define julia-snail-mode-menu julia-snail-mode-map
+  "Julia-Snail mode menu."
+  '("Snail"
+    ["Switch to REPL" julia-snail]
+    ["Activate package" julia-snail-package-activate]
+    ["Lookup documentation" julia-snail-doc-lookup]
+    ["Copy last inline result" julia-snail-copy-last-eval-result]
+    ["Update module cache" julia-snail-update-module-cache]
+    "---"
+    ["Evaluate line" julia-snail-send-line]
+    ["Evaluate top-level form" julia-snail-send-top-level-form]
+    ["Evaluate region" julia-snail-send-region :active (region-active-p)]
+    ["Evaluate file" julia-snail-send-buffer-file]))
+
+(easy-menu-define julia-snail-repl-mode-menu julia-snail-repl-mode-map
+  "Julia-Snail REPL mode menu."
+  '("Snail REPL"
+    ["Switch to source" julia-snail-repl-go-back]))
 
 (define-minor-mode julia-snail-message-buffer-mode
   "A minor mode for displaying messages returned from the Julia REPL."
