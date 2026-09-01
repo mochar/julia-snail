@@ -406,94 +406,165 @@ Uses function `compilation-shell-minor-mode'.")
 
 ;;;; Client-side request queue
 
-;; Queued requests are stored in `julia-snail--requests' but not immediately
-;; executed. The request left and right in the queue are stored in the request's
-;; `queue-neighbors' slot, forming a linked list. The head and tail of the queue
-;; are also stored as a cons in `julia-snail--queue-ends' for quick access. If
-;; there's only one request in the queue, the cdr is nil.
-
+;; When `julia-snail-queue-client-side' is non-nil, queued requests are handled
+;; in Emacs rather than Julia. Queued requests are stored in
+;; `julia-snail--requests' but not immediately executed. The requests left and
+;; right in the queue are stored in the request's `queue-neighbors' slot,
+;; forming a doubly linked list.
+;;
+;; However since quick access to the head and tail of the queue is needed, they
+;; are stored as a cons cell of (HEAD . TAIL) in the buffer-local variable
+;; `julia-snail--queue-ends' for each REPL buffer (if there's only one request
+;; in the queue, the cdr is nil, NOT the head).
+;;
 ;; These functions only handle updating queue, they don't send any requests or
 ;; interruptions.
 
-(defvar julia-snail--queue-ends (cons nil nil)
-  "The head and tail requests of the queue.")
+(defvar-local julia-snail--queue-ends nil
+  "The head and tail requests of the queue for this REPL session.
+A cons cell of (HEAD . TAIL). If there is only one request, TAIL is nil.")
+
+(defun julia-snail--queue-ends (&optional repl-buf)
+  "Return the `julia-snail--queue-ends' cons for REPL-BUF.
+If REPL-BUF is nil, defaults to `julia-snail-repl-buffer'.
+Initializes it to (nil . nil) if not yet set."
+  (let ((buf (get-buffer (or repl-buf julia-snail-repl-buffer))))
+    (unless buf
+      (error "No REPL buffer found"))
+    (with-current-buffer buf
+      (unless (consp julia-snail--queue-ends)
+        (setq-local julia-snail--queue-ends (cons nil nil)))
+      julia-snail--queue-ends)))
 
 (defun julia-snail--queue-add (request)
-  "Add REQUEST to the queue.
+  "Add REQUEST to the queue of its REPL buffer.
 If the queue is empty, set the car of `julia-snail--queue-ends',
 otherwise set its cdr and update the previous tail's neighbors slot."
-  (pcase-let ((`(,head . ,tail) julia-snail--queue-ends))
-    (if (null head)
-        (setf (car julia-snail--queue-ends) request)
-      (let ((tail (or tail head)))
-        (setf (cdr julia-snail--queue-ends) request
-              (julia-snail-request-queue-neighbors request) (cons tail nil)
-              (cdr (julia-snail-request-queue-neighbors tail)) request)))))
+  (let* ((repl-buf (julia-snail-request-repl-buf request))
+         (queue-ends (julia-snail--queue-ends repl-buf)))
+    (pcase-let ((`(,head . ,tail) queue-ends))
+      (if (null head)
+          (setf (car queue-ends) request)
+        (let ((tail (or tail head)))
+          (setf (cdr queue-ends) request
+                (julia-snail-request-queue-neighbors request) (cons tail nil)
+                (cdr (julia-snail-request-queue-neighbors tail)) request))))))
 
-(defun julia-snail--queue-pop ()
-  "Remove the head from the queue and return it.
-Updates the neighbor slots of the effected requests."
-  (pcase-let* ((`(,head . ,tail) julia-snail--queue-ends))
+(defun julia-snail--queue-remove (request)
+  "Unlink REQUEST from its REPL session queue.
+Updates `julia-snail--queue-ends' and the neighbor slots of the affected
+requests."
+  (when-let* ((repl-buf (julia-snail-request-repl-buf request))
+              (queue-ends (julia-snail--queue-ends repl-buf)))
+    (pcase-let* ((`(,head . ,tail) queue-ends)
+                 (`(,left . ,right) (julia-snail-request-queue-neighbors request)))
+      ;; Unlink left and right neighbors
+      (when left
+        (setf (cdr (julia-snail-request-queue-neighbors left)) right))
+      (when right
+        (setf (car (julia-snail-request-queue-neighbors right)) left))
+
+      ;; Update head
+      (when (eq request head)
+        (setf (car queue-ends) right))
+
+      ;; Update tail: if request was tail (or head when 1 element), new tail is left
+      (let* ((effective-tail (or tail head))
+             (new-tail (if (eq request effective-tail) left tail))
+             (new-head (car queue-ends)))
+        (setf (cdr queue-ends)
+              (if (or (null new-head) (null new-tail) (eq new-head new-tail))
+                  nil
+                new-tail)))
+
+      ;; Clear neighbors on the removed request
+      (setf (julia-snail-request-queue-neighbors request) nil))))
+
+(defun julia-snail--queue-pop (&optional repl-buf)
+  "Remove the head from the queue of REPL-BUF and return it.
+Updates the neighbor slots of the affected requests."
+  (let* ((queue-ends (julia-snail--queue-ends repl-buf))
+         (head (car queue-ends)))
     (when head
-      (let ((next (cdr (julia-snail-request-queue-neighbors head))))
-        (setf (car julia-snail--queue-ends) next
-              (julia-snail-request-queue-neighbors head) nil)
-        (when next
-          (setf (car (julia-snail-request-queue-neighbors next)) nil)
-          (when (eq next tail)
-            (setf (cdr julia-snail--queue-ends) nil))))
-      head)))
+      (julia-snail--queue-remove head))
+    head))
 
 (defun julia-snail--queue-flush (request)
-  "Remove REQUEST and its right-neighbours from the queue, returns the latter."
-  (pcase-let* ((`(,head . ,tail) julia-snail--queue-ends)
-               (`(,left . ,right) (julia-snail-request-queue-neighbors request)))
+  "Remove REQUEST and its right-neighbours from their REPL session queue,
+returns the right-neighbours."
+  (when-let* ((repl-buf (julia-snail-request-repl-buf request))
+              (queue-ends (julia-snail--queue-ends repl-buf)))
+    (pcase-let* ((`(,head . ,tail) queue-ends)
+                 (`(,left . ,right) (julia-snail-request-queue-neighbors request)))
 
-    ;; Remove REQUEST from left-neighbour
-    (when left
-      (setf (cdr (julia-snail-request-queue-neighbors left)) nil))
+      ;; Remove REQUEST from left-neighbour
+      (when left
+        (setf (cdr (julia-snail-request-queue-neighbors left)) nil))
 
-    ;; Update queue ends
-    (cond
-     ((eq request head)
-      (setq julia-snail--queue-ends (cons nil nil)))
-     ((eq left head)
-      (setf (cdr julia-snail--queue-ends) nil))
-     (left
-      (setf (cdr julia-snail--queue-ends) left))
-     (t
-      ;; Left is nil and REQUEST is not the queue head, which means the request
-      ;; was already removed from the queue.
-      ))
+      ;; Update queue ends
+      (cond
+       ((eq request head)
+        (setf (car queue-ends) nil
+              (cdr queue-ends) nil))
+       ((eq left head)
+        (setf (cdr queue-ends) nil))
+       (left
+        (setf (cdr queue-ends) left))
+       (t
+        ;; Left is nil and REQUEST is not the queue head, which means the request
+        ;; was already removed from the queue.
+        ))
 
-    ;; Set neighbors of REQUEST to nil
-    (setf (julia-snail-request-queue-neighbors request) nil)
-    
-    ;; Gather right-remainder reqs while setting their neighbors to nil
-    (let ((remainder (list)))
-      (named-let recur ((next right))
-        (when next
-          (push next remainder)
-          (prog1 (recur (cdr (julia-snail-request-queue-neighbors next)))
-            (setf (julia-snail-request-queue-neighbors next) nil))))
-      remainder)))
+      ;; Set neighbors of REQUEST to nil
+      (setf (julia-snail-request-queue-neighbors request) nil)
 
-(defun julia-snail--queue-elements ()
-  "Return sorted list of requests based on their queue position."
-  (when-let* ((cur (car julia-snail--queue-ends))
-              (queue (list cur)))
-    (while-let ((next (cdr (julia-snail-request-queue-neighbors cur))))
-      (push next queue)
-      (setq cur next))
-    (nreverse queue)))
-  
+      ;; Gather right-remainder reqs while setting their neighbors to nil
+      (let ((remainder (list)))
+        (named-let recur ((next right))
+          (when next
+            (push next remainder)
+            (prog1 (recur (cdr (julia-snail-request-queue-neighbors next)))
+              (setf (julia-snail-request-queue-neighbors next) nil))))
+        remainder))))
+
+(defun julia-snail--queue-elements (&optional repl-buf)
+  "Return sorted list of requests based on their queue position.
+
+If REPL-BUF is given, return elements for that REPL buffer.
+If REPL-BUF is nil, defaults to `julia-snail-repl-buffer'.
+If REPL-BUF is 'all, return elements across all live REPL buffers."
+  (if (eq repl-buf 'all)
+      (apply
+       #'append
+       (mapcar #'julia-snail--queue-elements
+               (julia-snail--live-repl-buffers)))
+    (when-let* ((queue-ends (julia-snail--queue-ends (or repl-buf julia-snail-repl-buffer)))
+                (cur (car queue-ends))
+                (queue (list cur)))
+      (while-let ((next (cdr (julia-snail-request-queue-neighbors cur))))
+        (push next queue)
+        (setq cur next))
+      (nreverse queue))))
+
 (defun julia-snail--queue-contains-p (request)
-  "Return non-nil if REQUEST in queue."
-  ; Alternatively we could have checked if car and cdr of queue-neighbors slot
-  ; are both nil.
+  "Return non-nil if REQUEST is in its REPL session queue."
   (or (eq (julia-snail-request-state request) :queued)
-      (eq request (car julia-snail--queue-ends))))
+      ;; Check if head of queue
+      (when-let* ((repl-buf (julia-snail-request-repl-buf request))
+                  (queue-ends (condition-case nil
+                                  (julia-snail--queue-ends repl-buf)
+                                (error nil))))
+        (eq request (car queue-ends)))))
+
 ;;;; Supporting functions
+
+(defun julia-snail--live-repl-buffers ()
+  "Return a list of all live Julia Snail REPL buffers."
+  (seq-filter
+   (lambda (buf)
+     (and (buffer-live-p buf)
+          (buffer-local-value 'julia-snail-repl-mode buf)))
+   (buffer-list)))
 
 (defun julia-snail--copy-buffer-local-vars (from-buf)
   "Copy Snail-related buffer-local variables from FROM-BUF to the current buffer."
@@ -502,6 +573,7 @@ Updates the neighbor slots of the effected requests."
            (var-name (symbol-name var))
            (val (cdr blv)))
       (when (and (string-prefix-p "julia-snail-" var-name)
+                 (not (string-prefix-p "julia-snail--queue" var-name))
                  (not (string-suffix-p "-mode" var-name)))
         (set var val)))))
 
@@ -908,17 +980,21 @@ returns \"/home/username/file.jl\"."
 
 ;;;; Mode line
 
-;; A lot copied from bufferlo.
 ;; This stores the mode line info in `mode-line-misc-info' rather than setting
 ;; the 'lighter' of the minor mode. This makes it visible when `mode-line-modes'
 ;; is removed from `mode-line-format' (which is what I have).
+;;
+;; A lot copied from the Bufferlo package.
 
 (defvar julia-snail-mode-line)
-(defvar julia-snail--mode-line-spinner (spinner-create 'horizontal-breathing))
+(defvar-local julia-snail--mode-line-spinner nil
+  "Spinner that indicates that at least one request is being processed by Julia.
+This is buffer-local to the REPL buffer.")
 (defvar julia-snail--mode-line-modes
   '(julia-snail-mode julia-snail-repl-mode julia-snail-ob-mode))
 
 (defun julia-snail--mode-line-mode-p ()
+  "Return t if current buffer has one of julia snail's minor modes active."
   (when (seq-find
          (lambda (mode) (and (boundp mode) (symbol-value mode)))
          julia-snail--mode-line-modes)
@@ -935,12 +1011,16 @@ returns \"/home/username/file.jl\"."
 (defun julia-snail-mode-line-format ()
   "Julia Snail mode-line format to display active session state."
   (when (julia-snail--mode-line-mode-p)
-    (format
-     "%s%s%s"
-     (julia-snail--mode-lighter)
-     (or (spinner-print julia-snail--mode-line-spinner) "  ")
-     "" ;; (propertize julia-snail-repl-buffer 'face 'shadow)
-     )))
+    (let ((repl-buf (get-buffer julia-snail-repl-buffer)))
+      (when (buffer-live-p repl-buf) 
+        (format
+         "%s%s%s"
+         (julia-snail--mode-lighter)
+         (or (with-current-buffer repl-buf
+               (spinner-print julia-snail--mode-line-spinner))
+             "  ")
+         "" ;; (propertize julia-snail-repl-buffer 'face 'shadow)
+         )))))
 
 (defun julia-snail--reset-mode-line ()
   "Remove the julia-snail mode line entry."
@@ -1188,9 +1268,9 @@ The following keys are set:
 
 (defun julia-snail--send-request (request)
   "Send REQUEST to the snail server.
-This assumes that the msg-data slot contains (msg . display-msg), which after
-sending will be set to nil. This also assumes REQUEST is already stored in
-`julia-snail--requests'."
+This assumes that the msg-data slot contains (msg . display-msg), which
+after sending will be set to nil. This also assumes REQUEST is already
+stored in `julia-snail--requests'."
   (with-slots (id repl-buf msg-data) request
     (let* ((process-buf (julia-snail--process-buffer-name repl-buf))
            (msg (car msg-data))
@@ -1201,7 +1281,11 @@ sending will be set to nil. This also assumes REQUEST is already stored in
       (process-send-string process-buf msg)
       (setf (julia-snail-request-msg-data request) nil ; dont need it anymore
             (julia-snail-request-state request) :busy)
-      (spinner-start julia-snail--mode-line-spinner))))
+      (with-current-buffer repl-buf
+        (unless julia-snail--mode-line-spinner
+          (setq julia-snail--mode-line-spinner
+                (spinner-create 'horizontal-breathing)))
+        (spinner-start julia-snail--mode-line-spinner)))))
 
 (cl-defun julia-snail--send-to-server
     (module
@@ -1320,7 +1404,7 @@ the result and return it."
              )
         (progn
           (julia-snail--queue-add req)
-          (when (eq (car julia-snail--queue-ends) req)
+          (when (eq (car (julia-snail--queue-ends repl-buf)) req)
             (julia-snail--send-request req)))
       (julia-snail--send-request req))
 
@@ -1404,8 +1488,8 @@ evaluated in the context of MODULE."
 
 (defun julia-snail--interrupt-request (reqid)
   "Interrupt request with id REQID.
-If queued request simply cancel, if already running send interrupt
-request to Julia."
+If queued request simply cancel, if already running send interrupt request to
+Julia."
   (let ((req (gethash reqid julia-snail--requests)))
     (unless req (error "Request with id `%s` not found" reqid))
     (cond
@@ -1474,24 +1558,27 @@ request to Julia."
     (setf (julia-snail-request-state request) :done)
     (when-let* ((tmpfile (julia-snail-request-tmpfile request)))
       (delete-file tmpfile))
-    (with-current-buffer (marker-buffer (julia-snail-request-marker request))
-      (spinner-stop))
-    (remhash reqid julia-snail--requests)
-    (when (hash-table-empty-p julia-snail--requests)
-      (spinner-stop julia-snail--mode-line-spinner))))
+    ;; TODO This is wrong as other requests can still be busy
+    (with-current-buffer (julia-snail-request-repl-buf request)
+      (spinner-stop julia-snail--mode-line-spinner))
+    (remhash reqid julia-snail--requests)))
 
 (defun julia-snail--response-success (reqid result)
   "Snail success response handler for REQID given RESULT."
-  (let* ((request (gethash reqid julia-snail--requests))
-         (data (julia-snail-request-data request)))
-    (when (and data result)
+  (when-let* ((request (gethash reqid julia-snail--requests)))
+
+    ;; Add result to data
+    (when-let* ((data (julia-snail-request-data request)))
       (setf (julia-snail-request-data-result data) result))
 
     ;; Handle queue
-    (when (eq request (car julia-snail--queue-ends))
-      (julia-snail--queue-pop)
-      (when-let* ((next-request (car julia-snail--queue-ends)))
-        (julia-snail--send-request next-request)))
+    (when-let* ((repl-buf (julia-snail-request-repl-buf request))
+                (queue-ends (julia-snail--queue-ends repl-buf)))
+      (let ((head-p (eq request (car queue-ends))))
+        (julia-snail--queue-remove request)
+        (when head-p
+          (when-let* ((next-request (car (julia-snail--queue-ends repl-buf))))
+            (julia-snail--send-request next-request)))))
 
     ;; Callback
     (when-let* ((callback-success (julia-snail-request-callback-success request)))
@@ -1501,11 +1588,15 @@ request to Julia."
 
 (defun julia-snail--response-failure (reqid error-message &optional error-stack)
   "Snail failure response handler for REQID with ERROR-MESSAGE and ERROR-STACK."
-  (let* ((request (gethash reqid julia-snail--requests))
-         (data (julia-snail-request-data request)))
-    (setf (julia-snail-request-data-error-message data) error-message
-          (julia-snail-request-data-error-stack data) error-stack)
-    (when (julia-snail-request-display-error-buffer-on-failure? request)
+  (let ((request (gethash reqid julia-snail--requests)))
+
+    ;; Add error to data
+    (when-let* ((data (when request (julia-snail-request-data request))))
+      (setf (julia-snail-request-data-error-message data) error-message
+            (julia-snail-request-data-error-stack data) error-stack))
+
+    ;; Display error buffer
+    (when (and request (julia-snail-request-display-error-buffer-on-failure? request))
       (let* ((repl-buf (julia-snail-request-repl-buf request))
              (process-buf (get-buffer (julia-snail--process-buffer-name repl-buf)))
              (error-buffer (julia-snail--message-buffer
@@ -1516,15 +1607,15 @@ request to Julia."
         (pop-to-buffer error-buffer)))
 
     ;; Callback
-    (when-let* ((callback (julia-snail-request-callback-failure request)))
+    (when-let* ((callback (when request (julia-snail-request-callback-failure request))))
       (funcall callback request error-message error-stack))
 
     ;; Base
     (julia-snail--response-base reqid)
-    
-    ;; Flush remaining requests if in queue. We must do this at the end to
-    ;; ensure callbacks are evaluated sequentially.
-    (when-let* ((remainder (julia-snail--queue-flush request)))
+
+    ;; Flush remaining requests if in queue. We must do this at the end to ensure
+    ;; callbacks are evaluated sequentially.
+    (when-let* ((remainder (when request (julia-snail--queue-flush request))))
       (dolist (queued-request remainder)
         (julia-snail--response-failure
          (julia-snail-request-id queued-request)
@@ -1534,15 +1625,15 @@ request to Julia."
   "Snail task interruption response handler for REQID."
   (let ((request (gethash reqid julia-snail--requests)))
     ;; Callback
-    (when-let* ((callback (julia-snail-request-callback-interrupt request)))
+    (when-let* ((callback (and request (julia-snail-request-callback-interrupt request))))
       (funcall callback request))
 
     ;; Base
     (julia-snail--response-base reqid)
-    
-    ;; Flush remaining requests if in queue. We must do this at the end to
-    ;; ensure callbacks are evaluated sequentially.
-    (when-let* ((remainder (julia-snail--queue-flush request)))
+
+    ;; Flush remaining requests if in queue. We must do this at the end to ensure
+    ;; callbacks are evaluated sequentially.
+    (when-let* ((remainder (when request (julia-snail--queue-flush request))))
       (dolist (queued-request remainder)
         (julia-snail--response-interrupt
          (julia-snail-request-id queued-request))))))
@@ -1589,7 +1680,7 @@ this uses overlays which cannot be copied over with (buffer-string)."
     (when-let* ((callback (julia-snail-request-callback-stream req)))
       (funcall callback req type))))
 
-;;;;; Display
+;;;;; Multimedia display
 
 ;; TODO Integrate with multimedia code
 
@@ -2429,7 +2520,7 @@ to search through."
 
 (defun julia-snail--completing-read-requests (&optional error-on-empty)
   (if-let* ((requests (append
-                       (julia-snail--queue-elements)
+                       (julia-snail--queue-elements 'all)
                        (seq-keep
                         (lambda (req)
                           (unless (julia-snail--queue-contains-p req) req))
