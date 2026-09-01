@@ -1077,7 +1077,7 @@ module Tasks
 
 import Printf
 using Sockets
-using ..JuliaSnail: elexpr
+using ..JuliaSnail: elexpr, ElispKeyword
 
 struct QueuedRequest
     client::Sockets.TCPSocket
@@ -1092,6 +1092,15 @@ request_queue_lock = ReentrantLock()
 request_queue = QueuedRequest[]
 "Used to notify the queue worker that a new request is available."
 queue_cond = Base.Threads.Condition(request_queue_lock)
+
+"""Tell the client if we are idle or busy."""
+function send_state(client::Sockets.TCPSocket)
+    isopen(client) || return
+    idle = isempty(active_tasks) && isempty(request_queue)
+    state = idle ? :idle : :busy
+    resp = elexpr([Symbol("julia-snail--server-state"), ElispKeyword(state)])
+    println(client, resp)
+end
 
 """Drain remaining queued requests and sends failure response."""
 function cancel_queue!(reason::String="Request canceled: prior queued request failed.")
@@ -1326,6 +1335,7 @@ function schedule_request(client::TCPSocket, payload::NamedTuple, code::Expr)::T
         Tasks.active_tasks[payload.reqid] = req_task
     end
     schedule(req_task)
+    Tasks.send_state(client)
     req_task
 end
 
@@ -1369,6 +1379,7 @@ function process_request(client::TCPSocket, payload::NamedTuple, code::Expr)::Bo
         lock(Tasks.active_tasks_lock) do
             delete!(Tasks.active_tasks, reqid)
         end
+        Tasks.send_state(client)
     end
     return success
 end

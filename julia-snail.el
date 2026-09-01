@@ -971,13 +971,6 @@ returns \"/home/username/file.jl\"."
     (declare-function get-current-persp "persp-mode.el")
     (persp-add-buffer buf (get-current-persp) nil)))
 
-(defun julia-snail--spinner-print-around (fn &rest args)
-  "Advice for `spinner-print` to add a leading space so the spinner looks nicer in the modeline."
-  (let ((fn-res (apply fn args)))
-    (if (> (length fn-res) 0)
-        (concat " " fn-res)
-      fn-res)))
-
 ;;;; Mode line
 
 ;; This stores the mode line info in `mode-line-misc-info' rather than setting
@@ -1018,7 +1011,7 @@ This is buffer-local to the REPL buffer.")
          (julia-snail--mode-lighter)
          (or (with-current-buffer repl-buf
                (spinner-print julia-snail--mode-line-spinner))
-             "  ")
+             " ")
          "" ;; (propertize julia-snail-repl-buffer 'face 'shadow)
          )))))
 
@@ -1280,12 +1273,7 @@ stored in `julia-snail--requests'."
         (insert display-msg))
       (process-send-string process-buf msg)
       (setf (julia-snail-request-msg-data request) nil ; dont need it anymore
-            (julia-snail-request-state request) :busy)
-      (with-current-buffer repl-buf
-        (unless julia-snail--mode-line-spinner
-          (setq julia-snail--mode-line-spinner
-                (spinner-create 'horizontal-breathing)))
-        (spinner-start julia-snail--mode-line-spinner)))))
+            (julia-snail-request-state request) :busy))))
 
 (cl-defun julia-snail--send-to-server
     (module
@@ -1434,8 +1422,6 @@ the result and return it."
                              (format "Snail error: %s" wait-result))))
             (when callback-failure
               (funcall callback-failure req "Snail command timed out" nil))
-            (with-current-buffer (marker-buffer marker)
-              (spinner-stop))
             (error error-msg)))))))
 
 (cl-defun julia-snail--send-to-server-via-tmp-file
@@ -1558,9 +1544,6 @@ Julia."
     (setf (julia-snail-request-state request) :done)
     (when-let* ((tmpfile (julia-snail-request-tmpfile request)))
       (delete-file tmpfile))
-    ;; TODO This is wrong as other requests can still be busy
-    (with-current-buffer (julia-snail-request-repl-buf request)
-      (spinner-stop julia-snail--mode-line-spinner))
     (remhash reqid julia-snail--requests)))
 
 (defun julia-snail--response-success (reqid result)
@@ -1693,6 +1676,20 @@ this uses overlays which cannot be copied over with (buffer-string)."
     (when-let* ((callback (julia-snail-request-callback-display req)))
       (funcall callback req display))))
 
+;;;;; Server state
+
+(defun julia-snail--server-state (state)
+  ;; Current buffer is server process buffer which has `julia-snail-repl-buffer'
+  ;; set accordingly.
+  (with-current-buffer julia-snail-repl-buffer
+    (pcase state
+      (:idle
+       (spinner-stop julia-snail--mode-line-spinner))
+      (:busy
+       (unless julia-snail--mode-line-spinner
+         (setq julia-snail--mode-line-spinner
+               (spinner-create 'horizontal-breathing)))
+       (spinner-start julia-snail--mode-line-spinner)))))
 
 ;;;; CST parser interface
 
@@ -2346,9 +2343,6 @@ What consitutes the first part is determined using `julia-snail-srcbuf-ov--fold-
                         (generate-new-buffer-name mm-buf-name-base)))
          (mm-buf (get-buffer-create mm-buf-name))
          (decoded-img (base64-decode-string img)))
-    (when (bound-and-true-p julia-snail--repl-go-back-target)
-      (with-current-buffer julia-snail--repl-go-back-target
-        (spinner-stop)))
     (with-current-buffer mm-buf
       ;; allow directly-inserted images to be erased
       (fundamental-mode)
@@ -2884,7 +2878,6 @@ The following keys are set:
         ;; (hack-dir-local-variables-non-file-buffer) ; force .dir-locals.el to load
         (add-hook 'xref-backend-functions #'julia-snail-xref-backend nil t)
         (add-function :before-until (local 'eldoc-documentation-function) #'julia-snail-eldoc)
-        (advice-add 'spinner-print :around #'julia-snail--spinner-print-around)
         (setq julia-snail--imenu-fallback-index-function imenu-create-index-function)
         (setq imenu-create-index-function 'julia-snail-imenu)
         (if (and (or (locate-library "company-quickhelp")
@@ -2900,7 +2893,6 @@ The following keys are set:
     (remove-hook 'completion-at-point-functions #'julia-snail-repl-completion-at-point t)
     (setq imenu-create-index-function julia-snail--imenu-fallback-index-function)
     (setq julia-snail--imenu-fallback-index-function nil)
-    (advice-remove 'spinner-print #'julia-snail--spinner-print-around)
     (remove-function (local 'eldoc-documentation-function) #'julia-snail-eldoc)
     (remove-hook 'xref-backend-functions #'julia-snail-xref-backend t)))
 
