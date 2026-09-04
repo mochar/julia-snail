@@ -2013,6 +2013,12 @@ this uses overlays which cannot be copied over with (buffer-string)."
   "Face used for the evaluation result overlays in source buffers."
   :group 'julia-snail)
 
+(defcustom julia-snail-srcbuf-overlay-face
+  'julia-snail-srcbuf-overlay
+  ""
+  :group 'julia-snail
+  :type 'face)
+
 (defvar-keymap julia-snail-srcbuf-overlay-keymap
   :doc "Keymap for source buffer overlays."
   "S-RET" 'julia-snail-srcbuf-ov-toggle-folding
@@ -2046,13 +2052,13 @@ this uses overlays which cannot be copied over with (buffer-string)."
                     " "
                     (propertize
                      julia-snail-srcbuf-overlay-prefix
-                     'face 'julia-snail-srcbuf-overlay)
+                     'face julia-snail-srcbuf-overlay-face)
                     ;; TODO This removes ansi applied colors, not sure how to fix it.
                     ;; add-face-text-property doesnt work.
                     ;; text
                     (propertize
                      text
-                     'face 'julia-snail-srcbuf-overlay
+                     'face julia-snail-srcbuf-overlay-face
                      )
                     )))
       ;; (add-face-text-property 0 (length display) 'underline t display)
@@ -2069,7 +2075,7 @@ this uses overlays which cannot be copied over with (buffer-string)."
    " "
    (propertize
     julia-snail-srcbuf-overlay-prefix
-    'face 'julia-snail-srcbuf-overlay)
+    'face julia-snail-srcbuf-overlay-face)
    "\n"
    (propertize " " 'display img)))
 
